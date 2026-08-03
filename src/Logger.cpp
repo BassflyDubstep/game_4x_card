@@ -1,3 +1,4 @@
+// Logger.cpp
 #include "Logger.h"
 
 void Logger::log(Level level, StringView message) {

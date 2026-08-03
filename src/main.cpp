@@ -7,8 +7,7 @@
 
 int main() {
     // Initial logging.
-    std::stringstream msg;
-    msg << "Game Starting: " << GAME_TITLE << std::endl;
+    std::cout << "Game Starting: " << GAME_TITLE << std::endl;
 
     // Initialize game object.
     Game game;

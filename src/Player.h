@@ -4,10 +4,9 @@
 #include "Aliases.h"
 #include "Globals.h"
 
-class Map {
+class Player {
 public:
-    Map();
+    Player();
 
 private:
-
 };

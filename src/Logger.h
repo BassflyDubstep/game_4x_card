@@ -2,6 +2,7 @@
 
 #include "Libraries.h"
 #include "Aliases.h"
+#include "Globals.h"
 
 class Logger {
 public:

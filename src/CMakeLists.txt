@@ -1,4 +1,8 @@
 add_library(game_4x_lib STATIC
+    Game.cpp
+    Logger.cpp
+    Map.cpp
+    Player.cpp
 )
 
 target_include_directories(game_4x_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

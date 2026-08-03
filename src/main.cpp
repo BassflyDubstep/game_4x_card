@@ -11,7 +11,7 @@ int main() {
     msg << "Game Starting: " << GAME_TITLE << std::endl;
 
     // Initialize game object.
-    Game game = game();
+    Game game;
 
     // Start game.
     game.run();

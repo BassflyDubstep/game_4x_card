@@ -26,4 +26,4 @@ public:
 private:
     std::unique_ptr<Map> map_;
     bool running_ = 1;
-}
+};

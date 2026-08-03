@@ -27,6 +27,10 @@ void Game::run() {
     }
 }
 
+void Game::kill() {
+    running_ = false;
+}
+
 bool Game::is_running() const {
     return running_;
 }

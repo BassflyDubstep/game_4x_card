@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 
 #ifdef _WIN32
 #include <windows.h>

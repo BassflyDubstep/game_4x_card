@@ -7,6 +7,7 @@
 
 class Player {
 public:
+    // Basic constructor
     Player();
 
 private:

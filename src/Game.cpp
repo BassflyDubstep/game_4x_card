@@ -2,8 +2,7 @@
 #include "Game.h"
 #include "Logger.h"
 
-Game::Game() {
-}
+Game::Game() {}
 
 Game::Game(std::unique_ptr<Map> map) {
     Logger::info("Game loaded with map.");

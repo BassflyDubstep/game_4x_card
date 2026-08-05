@@ -1,10 +1,14 @@
 // main.cpp
 #include "Libraries.h"
 #include "Aliases.h"
+#include "Globals.h"
 #include "Game.h"
 #include "Map.h"
 #include "Logger.h"
-#include "Globals.h"
+#include "Tile.h"
+#include "Player.h"
+#include "Card.h"
+#include "Regiment.h"
 
 int main() {
     // Initial logging.

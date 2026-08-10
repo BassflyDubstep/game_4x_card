@@ -20,7 +20,7 @@ class City:
 
 class Tile:
 
-    allowable_types = {
+    _allowable_types = {
         'grass':    {'passable_foot': True,  'passable_water': False, 'symbol': '.'},
         'water':    {'passable_foot': False, 'passable_water': True,  'symbol': '~'},
         'mountain': {'passable_foot': False, 'passable_water': False, 'symbol': '^'},
@@ -31,7 +31,7 @@ class Tile:
     def __init__(self, type: str = 'grass', x: int = None, y: int = None,
                  regiment_id: int = None, city_id: int = None,
                  resource_id: int = None):
-        if type not in Tile.allowable_types.keys():
+        if type not in Tile._allowable_types.keys():
             raise ValueError(f'Invalid tile type: {type}')
         self.type = type
         self.x = x
@@ -39,9 +39,9 @@ class Tile:
         self.regiment_id = regiment_id
         self.city_id = city_id
         self.resource_id = resource_id
-        self.passable_foot = self.allowable_types[type]['passable_foot']
-        self.passable_water = self.allowable_types[type]['passable_water']
-        self.symbol = self.allowable_types[type]['symbol']
+        self.passable_foot = self._allowable_types[type]['passable_foot']
+        self.passable_water = self._allowable_types[type]['passable_water']
+        self.symbol = self._allowable_types[type]['symbol']
 
 class Card:
 
@@ -97,7 +97,6 @@ class MapLoader:
             raise ValueError('Map file missing required "size" directive')
 
         game_map = Map(width=width, height=height, default_tile=default_type)
-#        game_map.tiles = {}
         for y in range(height):
             for x in range(width):
                 tile_type = explicit_tiles.get((x, y), default_type)

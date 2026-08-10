@@ -107,12 +107,84 @@ class MapLoader:
 class Menu:
 
     def __init__(self):
-        pass
+        self.options = []
+
+    def add_option(self, title: str, listener = None, shortcut: str = None):
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError('Menu option title must be a non-empty string')
+        if listener is not None and not callable(listener):
+            raise ValueError('Menu option listener must be callable')
+
+        if shortcut is None:
+            shortcut = title.strip()[0]
+        if not isinstance(shortcut, str) or len(shortcut.strip()) != 1:
+            raise ValueError('Menu option shortcut must be a single letter')
+
+        self.options.append({
+            'title': title.strip(),
+            'shortcut': shortcut.strip().lower(),
+            'listener': listener,
+        })
+        return len(self.options) - 1
+
+    def set_listener(self, selection, listener):
+        if not callable(listener):
+            raise ValueError('Menu option listener must be callable')
+        index = self._resolve_option_index(selection)
+        self.options[index]['listener'] = listener
+
+    def select_option(self, selection):
+        index = self._resolve_option_index(selection)
+        option = self.options[index]
+        if option['listener'] is not None:
+            return option['listener']()
+        return option
+
+    def _resolve_option_index(self, selection):
+        if not self.options:
+            raise ValueError('No menu options are available')
+
+        if isinstance(selection, int):
+            if 0 <= selection < len(self.options):
+                return selection
+            if 1 <= selection <= len(self.options):
+                return selection - 1
+            raise ValueError(f'Invalid menu selection: {selection}')
+
+        normalized = str(selection).strip().lower()
+        if not normalized:
+            raise ValueError('Menu selection cannot be empty')
+
+        if normalized.isdigit():
+            selected = int(normalized)
+            if 1 <= selected <= len(self.options):
+                return selected - 1
+
+        for index, option in enumerate(self.options):
+            if normalized == option['title'].lower():
+                return index
+            if normalized == option['shortcut']:
+                return index
+
+        raise ValueError(f'Invalid menu selection: {selection}')
 
 class ConsoleMenu(Menu):
 
     def __init__(self):
         super().__init__()
+
+    def print_options(self):
+        for index, option in enumerate(self.options, start=1):
+            print(f'{index}. ({option["shortcut"]}) {option["title"]}')
+
+    def prompt_and_select(self, prompt: str = 'Select an option: '):
+        while True:
+            self.print_options()
+            selection = input(prompt)
+            try:
+                return self.select_option(selection)
+            except ValueError as error:
+                print(error)
 
 class Game:
 

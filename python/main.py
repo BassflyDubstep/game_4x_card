@@ -62,7 +62,7 @@ class Map:
         self.default_tile = default_tile
         self.tiles = {}
 
-    def print_map(self):
+    def print(self):
         for y in range(self.height):
             for x in range(self.width):
                 print(self.tiles[(x, y)].symbol, end=' ')
@@ -74,7 +74,7 @@ class MapLoader:
         with open(filepath, 'r', encoding='utf-8') as map_file:
             self.map_data = map_file.read()
 
-    def parse_map(self):
+    def parse(self):
         width = None
         height = None
         default_type = 'grass'

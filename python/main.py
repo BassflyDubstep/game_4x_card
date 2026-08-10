@@ -39,6 +39,9 @@ class Tile:
         self.regiment_id = regiment_id
         self.city_id = city_id
         self.resource_id = resource_id
+        self.passable_foot = self.allowable_types[type]['passable_foot']
+        self.passable_water = self.allowable_types[type]['passable_water']
+        self.symbol = self.allowable_types[type]['symbol']
 
 class Card:
 
@@ -57,9 +60,16 @@ class Map:
         self.width = width
         self.height = height
         self.default_tile = default_tile
+        self.tiles = {}
+
+    def print_map(self):
+        for y in range(self.height):
+            for x in range(self.width):
+                print(self.tiles[(x, y)].symbol, end=' ')
+            print('')
 
 class MapLoader:
-    
+
     def __init__(self, filepath: str):
         with open(filepath, 'r', encoding='utf-8') as map_file:
             self.map_data = map_file.read()
@@ -87,7 +97,7 @@ class MapLoader:
             raise ValueError('Map file missing required "size" directive')
 
         game_map = Map(width=width, height=height, default_tile=default_type)
-        game_map.tiles = {}
+#        game_map.tiles = {}
         for y in range(height):
             for x in range(width):
                 tile_type = explicit_tiles.get((x, y), default_type)

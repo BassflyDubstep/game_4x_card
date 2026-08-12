@@ -280,7 +280,7 @@ class Map:
         self.regiment_movement_used[regiment_id] = used_distance + distance
 
     def reset_regiment_movement(self):
-        self.regiment_movement_used = {}
+        self.regiment_movement_used.clear()
 
     def print_regiment_metadata(self, regiment: Regiment):
         if regiment is None:

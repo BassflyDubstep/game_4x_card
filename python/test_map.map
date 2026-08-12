@@ -4,6 +4,30 @@ size 20 50
 # Default tile type (fills all unspecified tiles)
 default grass
 
+# Players: player <id> <name...> <color>
+player 1 Crimson_Legion red
+player 2 Azure_Dominion blue
+
+# Cities: city/capital <city_id> <owner_id> <name...> <population>
+capital 1 1 Sunkeep 2800
+capital 2 1 Ironcrown 2600
+city 3 1 Greenhaven 1700
+city 4 1 Oakwatch 1500
+capital 5 2 Frostspire 2850
+capital 6 2 Stormrest 2550
+city 7 2 Mistvale 1650
+city 8 2 Dawnmere 1450
+
+# City tile attachments: x y city/capital <city_id>
+2 2 capital 1
+4 30 capital 2
+6 43 city 3
+11 12 city 4
+14 10 capital 5
+15 32 capital 6
+12 44 city 7
+16 26 city 8
+
 # Non-default tiles: x y type
 # (x = column 0..19, y = row 0..49)
 #

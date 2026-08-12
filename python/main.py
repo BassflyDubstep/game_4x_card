@@ -180,6 +180,7 @@ class Map:
         self.players: dict[int, Player] = {}
         self.cities: dict[int, City] = {}
         self.regiments: dict[int, Regiment] = {}
+        self.regiment_movement_used: dict[int, int] = {}
         self.next_regiment_id = 1
 
     def add_player(self, player: Player):
@@ -266,11 +267,20 @@ class Map:
         delta_y = abs(target_y - start[1])
         distance = max(delta_x, delta_y)
         max_distance = regiment.movement_range()
-        if distance > max_distance:
-            raise ValueError(f'Regiment {regiment_id} can move at most {max_distance} tiles this turn')
+        used_distance = self.regiment_movement_used.get(regiment_id, 0)
+        remaining_distance = max_distance - used_distance
+        if distance > remaining_distance:
+            raise ValueError(
+                f'Regiment {regiment_id} can move at most {remaining_distance} more tiles this turn '
+                f'({used_distance}/{max_distance} used)'
+            )
 
         self.tiles[start].regiment_id = None
         target_tile.regiment_id = regiment_id
+        self.regiment_movement_used[regiment_id] = used_distance + distance
+
+    def reset_regiment_movement(self):
+        self.regiment_movement_used = {}
 
     def print_regiment_metadata(self, regiment: Regiment):
         if regiment is None:
@@ -750,6 +760,7 @@ class Game:
 
         def advance_turn():
             self.turn += 1
+            self.map.reset_regiment_movement()
             process_regiment_build_queue()
             self.map.print()
 

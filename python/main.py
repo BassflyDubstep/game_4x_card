@@ -98,6 +98,7 @@ class Regiment:
 
         self.regiment_attack_score = 0.0
         self.city_attack_score = 0.0
+        self.movement_spent_this_turn = 0
         self.recalculate_attack_scores()
 
     def _validate_unit_count(self, value: int, unit_type: str):
@@ -137,6 +138,18 @@ class Regiment:
         # Larger and stronger regiments move less distance per turn.
         movement = 8 - (self.total_units() / 25) - (self.regiment_attack_score / 120)
         return max(1, int(round(movement)))
+
+    def movement_remaining(self):
+        return max(0, self.movement_range() - self.movement_spent_this_turn)
+
+    def can_move_distance(self, distance: int):
+        return distance <= self.movement_remaining()
+
+    def record_movement(self, distance: int):
+        self.movement_spent_this_turn += max(0, distance)
+
+    def reset_turn_movement(self):
+        self.movement_spent_this_turn = 0
 
     def recalculate_attack_scores(self):
         self.regiment_attack_score = self._compute_weighted_score(
@@ -265,12 +278,19 @@ class Map:
         delta_x = abs(target_x - start[0])
         delta_y = abs(target_y - start[1])
         distance = max(delta_x, delta_y)
-        max_distance = regiment.movement_range()
-        if distance > max_distance:
-            raise ValueError(f'Regiment {regiment_id} can move at most {max_distance} tiles this turn')
+        if not regiment.can_move_distance(distance):
+            raise ValueError(
+                f'Regiment {regiment_id} has {regiment.movement_remaining()} movement remaining this turn '
+                f'and cannot move {distance} tiles'
+            )
 
         self.tiles[start].regiment_id = None
         target_tile.regiment_id = regiment_id
+        regiment.record_movement(distance)
+
+    def reset_regiment_movement_for_new_turn(self):
+        for regiment in self.regiments.values():
+            regiment.reset_turn_movement()
 
     def print_regiment_metadata(self, regiment: Regiment):
         if regiment is None:
@@ -681,6 +701,23 @@ class Game:
 
             self.regiment_build_queue = [o for o in self.regiment_build_queue if o not in completed_orders]
 
+        def print_regiment_build_queue_status(show_empty_message: bool = True):
+            if not self.regiment_build_queue:
+                if show_empty_message:
+                    print('No regiments are currently queued for production.')
+                return
+
+            print('REGIMENT BUILD QUEUE:')
+            for order in self.regiment_build_queue:
+                city = self.map.get_city(order['city_id']) if self.map is not None else None
+                city_name = city.name if city is not None else f'City {order["city_id"]}'
+                turns_remaining = max(0, order['turns_remaining'])
+                print(
+                    f"  {turns_remaining} turn(s) until Regiment '{order['regiment_name']}' "
+                    f'appears at {city_name}.'
+                )
+            print('')
+
         def create_regiment_order():
             city_id_raw = input('Enter city id to spawn regiment from: ').strip()
             if not city_id_raw.isdigit():
@@ -733,25 +770,25 @@ class Game:
             except ValueError as error:
                 print(error)
 
-        def print_regiment_metadata_at_tile():
-            target_raw = input('Enter tile to inspect as x y: ').strip().split()
-            if len(target_raw) != 2:
-                print('Tile must be provided as two integers: x y')
+        def print_regiment_metadata_by_id():
+            regiment_id_raw = input('Enter regiment id to inspect: ').strip()
+            if not regiment_id_raw.isdigit():
+                print('Regiment id must be a positive integer.')
                 return
-            if not target_raw[0].lstrip('-').isdigit() or not target_raw[1].lstrip('-').isdigit():
-                print('Tile must be numeric coordinates.')
-                return
-            target_x, target_y = int(target_raw[0]), int(target_raw[1])
-            regiment = self.map.get_regiment_at(target_x, target_y)
+
+            regiment_id = int(regiment_id_raw)
+            regiment = self.map.get_regiment(regiment_id)
             if regiment is None:
-                print(f'No regiment found at ({target_x}, {target_y}).')
+                print(f'Regiment {regiment_id} does not exist.')
                 return
             self.map.print_regiment_metadata(regiment)
 
         def advance_turn():
             self.turn += 1
+            self.map.reset_regiment_movement_for_new_turn()
             process_regiment_build_queue()
             self.map.print()
+            print_regiment_build_queue_status(show_empty_message=False)
 
         def player_loop():
             player_menu = ConsoleMenu()
@@ -759,8 +796,9 @@ class Game:
             player_menu.add_option('Print Players', self.map.print_player_metadata, 'p')
             player_menu.add_option('Print Cities/Capitals', self.map.print_city_metadata, 'c')
             player_menu.add_option('Create Regiment', create_regiment_order, 'r')
+            player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
-            player_menu.add_option('Inspect Regiment At Tile', print_regiment_metadata_at_tile, 'i')
+            player_menu.add_option('Inspect Regiment By Id', print_regiment_metadata_by_id, 'i')
             player_menu.add_option('Next Turn', advance_turn, 't')
             player_menu.add_option('Quit to Main Menu', quit_to_main_menu, 'q')
             advance_turn()  # Print the map at the start of the player loop

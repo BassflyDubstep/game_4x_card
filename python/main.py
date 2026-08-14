@@ -612,8 +612,45 @@ class Game:
         self.map = map
         self.is_running = True
         self.player_in_loop = False
+        self.selected_player_id = None
         self.turn = 0
         self.regiment_build_queue = []
+
+    def get_selected_player(self):
+        if self.map is None or self.selected_player_id is None:
+            return None
+        return self.map.get_player(self.selected_player_id)
+
+    def select_player_empire(self):
+        if self.map is None:
+            raise ValueError('A map must be loaded before selecting an empire.')
+        if not self.map.players:
+            print('This map has no empires to select.')
+            self.selected_player_id = None
+            return False
+
+        print('Choose an empire for this match:')
+        self.map.print_player_metadata()
+
+        while True:
+            selection = input('Enter the empire/player id to control, or leave empty to cancel: ').strip()
+            if not selection:
+                print('Empire selection canceled.')
+                self.selected_player_id = None
+                return False
+            if not selection.isdigit():
+                print('Empire id must be a positive integer.')
+                continue
+
+            player_id = int(selection)
+            selected_player = self.map.get_player(player_id)
+            if selected_player is None:
+                print(f'Empire {player_id} does not exist on this map.')
+                continue
+
+            self.selected_player_id = player_id
+            print(f'You are now playing as {selected_player.name}.')
+            return True
 
     def run(self):
 
@@ -634,6 +671,11 @@ class Game:
                     continue
                 maploader = MapLoader(str(map_path))
                 self.map = maploader.parse()
+                self.turn = 0
+                self.regiment_build_queue = []
+                if not self.select_player_empire():
+                    self.map = None
+                    return
                 self.player_in_loop = True
                 player_loop()
                 return
@@ -702,13 +744,18 @@ class Game:
             self.regiment_build_queue = [o for o in self.regiment_build_queue if o not in completed_orders]
 
         def print_regiment_build_queue_status(show_empty_message: bool = True):
-            if not self.regiment_build_queue:
+            selected_player = self.get_selected_player()
+            visible_orders = self.regiment_build_queue
+            if selected_player is not None:
+                visible_orders = [order for order in self.regiment_build_queue if order['owner_id'] == selected_player.id]
+
+            if not visible_orders:
                 if show_empty_message:
-                    print('No regiments are currently queued for production.')
+                    print('No regiments are currently queued for production for your empire.')
                 return
 
             print('REGIMENT BUILD QUEUE:')
-            for order in self.regiment_build_queue:
+            for order in visible_orders:
                 city = self.map.get_city(order['city_id']) if self.map is not None else None
                 city_name = city.name if city is not None else f'City {order["city_id"]}'
                 turns_remaining = max(0, order['turns_remaining'])
@@ -719,6 +766,11 @@ class Game:
             print('')
 
         def create_regiment_order():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
             city_id_raw = input('Enter city id to spawn regiment from: ').strip()
             if not city_id_raw.isdigit():
                 print('City id must be a positive integer.')
@@ -728,6 +780,9 @@ class Game:
             city = self.map.get_city(city_id)
             if city is None:
                 print(f'City {city_id} does not exist.')
+                return
+            if city.owner_id != selected_player.id:
+                print(f'City {city_id} belongs to another empire. You may only create regiments from {selected_player.name} cities.')
                 return
 
             owner = self.map.get_player(city.owner_id)
@@ -745,6 +800,11 @@ class Game:
             print(f"Queued regiment '{regiment_name}' for {owner_name} from {city.name}. Ready in {turns_to_build} turn(s).")
 
         def move_regiment():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
             regiment_id_raw = input('Enter regiment id to move: ').strip()
             if not regiment_id_raw.isdigit():
                 print('Regiment id must be a positive integer.')
@@ -753,6 +813,9 @@ class Game:
             regiment = self.map.get_regiment(regiment_id)
             if regiment is None:
                 print(f'Regiment {regiment_id} does not exist.')
+                return
+            if regiment.owner_id != selected_player.id:
+                print(f'Regiment {regiment_id} belongs to another empire. You may only move {selected_player.name} regiments.')
                 return
 
             target_raw = input('Enter target tile as x y: ').strip().split()
@@ -803,7 +866,10 @@ class Game:
             player_menu.add_option('Quit to Main Menu', quit_to_main_menu, 'q')
             advance_turn()  # Print the map at the start of the player loop
             while self.player_in_loop:
+                selected_player = self.get_selected_player()
                 print(f'Turn {self.turn}')
+                if selected_player is not None:
+                    print(f'Empire: {selected_player.name} (Player {selected_player.id})')
                 print('---PLAYER OPTIONS---')
                 player_menu.prompt_and_select()
                 print('\n')

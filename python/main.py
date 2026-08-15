@@ -18,6 +18,11 @@ class Player:
 class City:
 
     _city_symbols = {'City': 'C', 'Capital': '*C'}
+    RESISTANCE_MULTIPLIER = 5.0
+    DEFENSE_SCALE = 1.0
+    BASE_SIEGE_RATE = 0.20
+    SIEGE_REGEN_RATE = 0.15
+    SACK_POPULATION_PENALTY = 0.30
     
     def __init__(self, id: int, name: str, owner_id: int, 
                  population: int = 1000, is_capital: bool = False,
@@ -28,16 +33,26 @@ class City:
         self.population = population
         self.is_capital = is_capital
         self.defense_score = defense_score if defense_score is not None else self._default_defense_score()
-        self.symbol = f'C{self.id}({self.owner_id})' if not is_capital else f'*C{self.id}({self.owner_id})'
+        self.max_siege_resistance = self._default_max_siege_resistance()
+        self.siege_resistance = self.max_siege_resistance
+        self._update_symbol()
 
     def mark_as_capital(self):
         self.is_capital = True
-        self.symbol = f'*C{self.id}({self.owner_id})'
         self.defense_score = self._default_defense_score()
+        self.max_siege_resistance = self._default_max_siege_resistance()
+        self.siege_resistance = self.max_siege_resistance
+        self._update_symbol()
 
     def _default_defense_score(self):
         # Population and capital status provide a simple defensive baseline.
         return round(20 + (self.population / 200) + (10 if self.is_capital else 0), 2)
+
+    def _default_max_siege_resistance(self):
+        return round(self.defense_score * self.RESISTANCE_MULTIPLIER, 2)
+
+    def _update_symbol(self):
+        self.symbol = f'{"*C" if self.is_capital else "C"}{self.id}({self.owner_id})'
 
 class Tile:
 
@@ -76,6 +91,8 @@ class Regiment:
         'ranged': 0.85,
         'cavalry': 1.15,
     }
+    BASE_BATTLE_RATE = 0.25
+    FORCE_SIZE_EXPONENT = 0.5
 
     CITY_ATTACK_WEIGHTS = {
         'infantry': 0.8,
@@ -194,6 +211,8 @@ class Map:
         self.cities: dict[int, City] = {}
         self.regiments: dict[int, Regiment] = {}
         self.next_regiment_id = 1
+        self.resolved_regiment_battles_this_turn: set[tuple[int, int]] = set()
+        self.resolved_sieges_this_turn: set[int] = set()
 
     def add_player(self, player: Player):
         self.players[player.id] = player
@@ -288,9 +307,183 @@ class Map:
         target_tile.regiment_id = regiment_id
         regiment.record_movement(distance)
 
+    def resolve_regiment_battle(self, regiment_a_id: int, regiment_b_id: int) -> dict:
+        regiment_a = self.get_regiment(regiment_a_id)
+        if regiment_a is None:
+            raise ValueError(f'Regiment {regiment_a_id} does not exist')
+        regiment_b = self.get_regiment(regiment_b_id)
+        if regiment_b is None:
+            raise ValueError(f'Regiment {regiment_b_id} does not exist')
+        if self.get_regiment_location(regiment_a_id) is None:
+            raise ValueError(f'Regiment {regiment_a_id} is not on the map')
+        if self.get_regiment_location(regiment_b_id) is None:
+            raise ValueError(f'Regiment {regiment_b_id} is not on the map')
+        if regiment_a.total_units() == 0:
+            raise ValueError(f'Regiment {regiment_a_id} has no units remaining')
+        if regiment_b.total_units() == 0:
+            raise ValueError(f'Regiment {regiment_b_id} has no units remaining')
+        if regiment_a.owner_id == regiment_b.owner_id:
+            raise ValueError(f'Regiments {regiment_a_id} and {regiment_b_id} belong to the same owner')
+
+        battle_key = tuple(sorted((regiment_a_id, regiment_b_id)))
+        if battle_key in self.resolved_regiment_battles_this_turn:
+            raise ValueError(
+                f'Battle between Regiment {regiment_a_id} and Regiment {regiment_b_id} has already been resolved this turn'
+            )
+
+        power_a = regiment_a.regiment_attack_score * (regiment_a.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
+        power_b = regiment_b.regiment_attack_score * (regiment_b.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
+        total_power = power_a + power_b
+        if total_power == 0:
+            loss_fraction_a = 0.0
+            loss_fraction_b = 0.0
+        else:
+            loss_fraction_a = Regiment.BASE_BATTLE_RATE * (power_b / total_power)
+            loss_fraction_b = Regiment.BASE_BATTLE_RATE * (power_a / total_power)
+
+        casualties_a = self._apply_regiment_battle_losses(
+            regiment_a,
+            min(
+                regiment_a.infantry + regiment_a.ranged + regiment_a.cavalry,
+                int(math.floor((regiment_a.total_units() * loss_fraction_a) + 0.5)),
+            ),
+        )
+        casualties_b = self._apply_regiment_battle_losses(
+            regiment_b,
+            min(
+                regiment_b.infantry + regiment_b.ranged + regiment_b.cavalry,
+                int(math.floor((regiment_b.total_units() * loss_fraction_b) + 0.5)),
+            ),
+        )
+
+        remaining_units_a = regiment_a.total_units()
+        remaining_units_b = regiment_b.total_units()
+        defeated_a = remaining_units_a == 0
+        defeated_b = remaining_units_b == 0
+
+        if defeated_a:
+            self._remove_regiment_from_map(regiment_a_id)
+        if defeated_b:
+            self._remove_regiment_from_map(regiment_b_id)
+
+        self.resolved_regiment_battles_this_turn.add(battle_key)
+        return {
+            'regiment_a_id': regiment_a_id,
+            'regiment_b_id': regiment_b_id,
+            'casualties_a': casualties_a,
+            'casualties_b': casualties_b,
+            'remaining_units_a': remaining_units_a,
+            'remaining_units_b': remaining_units_b,
+            'defeated_a': defeated_a,
+            'defeated_b': defeated_b,
+        }
+
+    def resolve_siege(self, regiment_id: int = None, city_id: int = None) -> dict:
+        if city_id is None:
+            raise ValueError('City id is required')
+
+        city = self.get_city(city_id)
+        if city is None:
+            raise ValueError(f'City {city_id} does not exist')
+        city_location = self.get_city_location(city_id)
+        if city_location is None:
+            raise ValueError(f'City {city_id} is not on the map')
+        if city_id in self.resolved_sieges_this_turn:
+            raise ValueError(f'Siege resolution for City {city_id} has already been resolved this turn')
+
+        regiment = None
+        if regiment_id is not None:
+            regiment = self.get_regiment(regiment_id)
+            if regiment is None:
+                raise ValueError(f'Regiment {regiment_id} does not exist')
+
+        resistance_before = city.siege_resistance
+        sacked = False
+        previous_owner_id = city.owner_id
+        regiment_location = self.get_regiment_location(regiment_id) if regiment_id is not None else None
+        is_besieging = (
+            regiment is not None and
+            regiment_location == city_location and
+            regiment.owner_id != city.owner_id
+        )
+
+        if is_besieging:
+            siege_pressure = regiment.city_attack_score * regiment.total_units()
+            total_pressure = siege_pressure + (city.defense_score * City.DEFENSE_SCALE)
+            loss_fraction = 0.0 if total_pressure == 0 else City.BASE_SIEGE_RATE * (siege_pressure / total_pressure)
+            resistance_loss = city.siege_resistance * loss_fraction
+            city.siege_resistance = round(max(0.0, city.siege_resistance - resistance_loss), 2)
+
+            if city.siege_resistance <= 0:
+                city.owner_id = regiment.owner_id
+                city.population = round(city.population * (1 - City.SACK_POPULATION_PENALTY))
+                city.siege_resistance = city.max_siege_resistance
+                city._update_symbol()
+                sacked = True
+        else:
+            city.siege_resistance = round(
+                min(
+                    city.max_siege_resistance,
+                    city.siege_resistance + (City.SIEGE_REGEN_RATE * city.max_siege_resistance),
+                ),
+                2,
+            )
+
+        self.resolved_sieges_this_turn.add(city_id)
+        result = {
+            'city_id': city_id,
+            'regiment_id': regiment_id,
+            'resistance_before': resistance_before,
+            'resistance_after': city.siege_resistance,
+            'max_resistance': city.max_siege_resistance,
+            'sacked': sacked,
+        }
+        if sacked:
+            result['previous_owner_id'] = previous_owner_id
+            result['new_owner_id'] = city.owner_id
+        return result
+
     def reset_regiment_movement_for_new_turn(self):
         for regiment in self.regiments.values():
             regiment.reset_turn_movement()
+
+    def reset_battle_resolution_for_new_turn(self):
+        self.resolved_regiment_battles_this_turn.clear()
+        self.resolved_sieges_this_turn.clear()
+
+    def _apply_regiment_battle_losses(self, regiment: Regiment, casualty_count: int):
+        casualties = {'infantry': 0, 'ranged': 0, 'cavalry': 0}
+        total_combat_units = regiment.infantry + regiment.ranged + regiment.cavalry
+        casualty_count = max(0, min(total_combat_units, casualty_count))
+        if casualty_count == 0 or total_combat_units == 0:
+            return casualties
+
+        shares = []
+        for unit_type in ('infantry', 'ranged', 'cavalry'):
+            unit_count = getattr(regiment, unit_type)
+            share = casualty_count * (unit_count / total_combat_units)
+            assigned = math.floor(share)
+            casualties[unit_type] = assigned
+            shares.append((unit_type, share - assigned))
+
+        casualties_remaining = casualty_count - sum(casualties.values())
+        shares.sort(key=lambda item: item[1], reverse=True)
+        for unit_type, _ in shares[:casualties_remaining]:
+            casualties[unit_type] += 1
+
+        regiment.update_composition(
+            infantry=max(0, regiment.infantry - casualties['infantry']),
+            ranged=max(0, regiment.ranged - casualties['ranged']),
+            cavalry=max(0, regiment.cavalry - casualties['cavalry']),
+            siege=regiment.siege,
+        )
+        return casualties
+
+    def _remove_regiment_from_map(self, regiment_id: int):
+        location = self.get_regiment_location(regiment_id)
+        if location is not None:
+            self.tiles[location].regiment_id = None
+        self.regiments.pop(regiment_id, None)
 
     def print_regiment_metadata(self, regiment: Regiment):
         if regiment is None:
@@ -849,6 +1042,7 @@ class Game:
         def advance_turn():
             self.turn += 1
             self.map.reset_regiment_movement_for_new_turn()
+            self.map.reset_battle_resolution_for_new_turn()
             process_regiment_build_queue()
             self.map.print()
             print_regiment_build_queue_status(show_empty_message=False)

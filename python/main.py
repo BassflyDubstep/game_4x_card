@@ -117,6 +117,7 @@ class Regiment:
         self.regiment_attack_score = 0.0
         self.city_attack_score = 0.0
         self.movement_spent_this_turn = 0
+        self.reorganized_this_turn = False
         self.recalculate_attack_scores()
 
     def _validate_unit_count(self, value: int, unit_type: str):
@@ -166,8 +167,16 @@ class Regiment:
     def record_movement(self, distance: int):
         self.movement_spent_this_turn += max(0, distance)
 
+    def consume_movement(self):
+        self.movement_spent_this_turn = self.movement_range()
+
     def reset_turn_movement(self):
         self.movement_spent_this_turn = 0
+        self.reorganized_this_turn = False
+
+    def mark_reorganized_this_turn(self):
+        self.reorganized_this_turn = True
+        self.consume_movement()
 
     def has_ranged_attack_capability(self):
         return self.ranged > 0 or getattr(self, 'navy', 0) > 0
@@ -321,6 +330,122 @@ class Map:
         self.tiles[start].regiment_id = None
         target_tile.regiment_id = regiment_id
         regiment.record_movement(distance)
+
+    def split_regiment(self, regiment_id: int, target_x: int, target_y: int,
+                       split_counts: dict[str, int], new_name: str = None):
+        regiment = self.get_regiment(regiment_id)
+        if regiment is None:
+            raise ValueError(f'Regiment {regiment_id} does not exist')
+        if regiment.total_units() == 0:
+            raise ValueError(f'Regiment {regiment_id} has no units remaining')
+        if regiment.reorganized_this_turn:
+            raise ValueError(f'Regiment {regiment_id} has already split or combined this turn')
+        if regiment.movement_remaining() < 1:
+            raise ValueError(f'Regiment {regiment_id} has no movement remaining to perform a split')
+
+        start = self.get_regiment_location(regiment_id)
+        if start is None:
+            raise ValueError(f'Regiment {regiment_id} is not on the map')
+        if (target_x, target_y) not in self.tiles:
+            raise ValueError(f'Target tile ({target_x}, {target_y}) is out of bounds')
+        if self.get_tile_distance(start, (target_x, target_y)) != 1:
+            raise ValueError('Split regiment must form on an adjacent tile')
+
+        target_tile = self.tiles[(target_x, target_y)]
+        if target_tile.regiment_id is not None:
+            raise ValueError(f'Target tile ({target_x}, {target_y}) already has a regiment')
+        if not target_tile.passable_foot:
+            raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments')
+
+        unit_types = ('infantry', 'ranged', 'cavalry', 'siege')
+        transfer_counts = {}
+        for unit_type in unit_types:
+            transfer_count = split_counts.get(unit_type, 0)
+            if not isinstance(transfer_count, int) or transfer_count < 0:
+                raise ValueError(f'Split count for {unit_type} must be a non-negative integer')
+            if transfer_count > getattr(regiment, unit_type):
+                raise ValueError(f'Regiment {regiment_id} does not have enough {unit_type} to split that amount')
+            transfer_counts[unit_type] = transfer_count
+
+        transferred_total = sum(transfer_counts.values())
+        if transferred_total == 0:
+            raise ValueError('Split must transfer at least one unit into the new regiment')
+
+        remaining_counts = {
+            unit_type: getattr(regiment, unit_type) - transfer_counts[unit_type]
+            for unit_type in unit_types
+        }
+        if sum(remaining_counts.values()) == 0:
+            raise ValueError('Split must leave at least one unit in the original regiment')
+
+        regiment_name = str(new_name).strip() if new_name is not None else ''
+        if not regiment_name:
+            regiment_name = f'{regiment.name} Detachment'
+
+        split_regiment = Regiment(
+            name=regiment_name,
+            owner_id=regiment.owner_id,
+            infantry=transfer_counts['infantry'],
+            ranged=transfer_counts['ranged'],
+            cavalry=transfer_counts['cavalry'],
+            siege=transfer_counts['siege'],
+        )
+        self.add_regiment(split_regiment, target_x, target_y)
+        regiment.update_composition(
+            infantry=remaining_counts['infantry'],
+            ranged=remaining_counts['ranged'],
+            cavalry=remaining_counts['cavalry'],
+            siege=remaining_counts['siege'],
+        )
+        regiment.mark_reorganized_this_turn()
+        split_regiment.mark_reorganized_this_turn()
+        return split_regiment
+
+    def combine_regiments(self, source_regiment_id: int, target_regiment_id: int):
+        if source_regiment_id == target_regiment_id:
+            raise ValueError('A regiment cannot combine into itself')
+
+        source_regiment = self.get_regiment(source_regiment_id)
+        if source_regiment is None:
+            raise ValueError(f'Regiment {source_regiment_id} does not exist')
+        target_regiment = self.get_regiment(target_regiment_id)
+        if target_regiment is None:
+            raise ValueError(f'Regiment {target_regiment_id} does not exist')
+        if source_regiment.owner_id != target_regiment.owner_id:
+            raise ValueError('Only regiments from the same empire may combine')
+        if source_regiment.total_units() == 0:
+            raise ValueError(f'Regiment {source_regiment_id} has no units remaining')
+        if target_regiment.total_units() == 0:
+            raise ValueError(f'Regiment {target_regiment_id} has no units remaining')
+        if source_regiment.reorganized_this_turn:
+            raise ValueError(f'Regiment {source_regiment_id} has already split or combined this turn')
+        if target_regiment.reorganized_this_turn:
+            raise ValueError(f'Regiment {target_regiment_id} has already split or combined this turn')
+        if source_regiment.movement_remaining() < 1:
+            raise ValueError(f'Regiment {source_regiment_id} has no movement remaining to perform a combine')
+        if target_regiment.movement_remaining() < 1:
+            raise ValueError(f'Regiment {target_regiment_id} has no movement remaining to perform a combine')
+
+        source_location = self.get_regiment_location(source_regiment_id)
+        target_location = self.get_regiment_location(target_regiment_id)
+        if source_location is None:
+            raise ValueError(f'Regiment {source_regiment_id} is not on the map')
+        if target_location is None:
+            raise ValueError(f'Regiment {target_regiment_id} is not on the map')
+        if self.get_tile_distance(source_location, target_location) != 1:
+            raise ValueError('Regiments must be on adjacent tiles to combine')
+
+        target_regiment.update_composition(
+            infantry=target_regiment.infantry + source_regiment.infantry,
+            ranged=target_regiment.ranged + source_regiment.ranged,
+            cavalry=target_regiment.cavalry + source_regiment.cavalry,
+            siege=target_regiment.siege + source_regiment.siege,
+        )
+        target_regiment.heroes.extend(source_regiment.heroes)
+        target_regiment.recalculate_attack_scores()
+        self._remove_regiment_from_map(source_regiment_id)
+        target_regiment.mark_reorganized_this_turn()
+        return target_regiment
 
     def resolve_regiment_battle(self, regiment_a_id: int, regiment_b_id: int) -> dict:
         regiment_a = self.get_regiment(regiment_a_id)
@@ -610,7 +735,7 @@ class Map:
         # Get the max character length for each column of the map for proper alignment
         col_widths = []
         for x in range(self.width):
-            col_width = 0
+            col_width = len(str(x))
             for y in range(self.height):
                 tile = self.tiles[(x, y)]
                 city = self.get_city(tile.city_id) if tile.city_id is not None else None
@@ -626,7 +751,11 @@ class Map:
 
         # Print the map
         print(f'\nMAP:')
+        row_label_width = max(1, len(str(self.height - 1)))
+        header_padding = ' ' * (row_label_width + 1)
+        print(f"{header_padding}{' '.join(str(x).center(col_widths[x]) for x in range(self.width))}")
         for y in range(self.height):
+            row_display = [str(y).rjust(row_label_width)]
             for x in range(self.width):
                 tile = self.tiles[(x, y)]
                 city = self.get_city(tile.city_id) if tile.city_id is not None else None
@@ -648,8 +777,8 @@ class Map:
                     color_code = self._get_player_color_code(owner.color) if owner is not None else ''
                     if color_code:
                         display_symbol = f'{color_code}{display_symbol}{Style.RESET_ALL}'
-                print(display_symbol, end=' ')
-            print('')
+                row_display.append(display_symbol)
+            print(' '.join(row_display))
 
         # Print the legend
         legend_entries = [f"{t}={Tile._allowable_types[t]['symbol']}" \
@@ -1055,6 +1184,12 @@ class Game:
             if city.owner_id != selected_player.id:
                 print(f'City {city_id} belongs to another empire. You may only create regiments from {selected_player.name} cities.')
                 return
+            if any(
+                order['city_id'] == city.id and order.get('queued_on_turn') == self.turn
+                for order in self.regiment_build_queue
+            ):
+                print(f'{city.name} has already queued a regiment this turn.')
+                return
 
             owner = self.map.get_player(city.owner_id)
             owner_name = owner.name if owner is not None else f'Unknown({city.owner_id})'
@@ -1067,6 +1202,7 @@ class Game:
                 'owner_id': city.owner_id,
                 'regiment_name': regiment_name,
                 'turns_remaining': turns_to_build,
+                'queued_on_turn': self.turn,
             })
             print(f"Queued regiment '{regiment_name}' for {owner_name} from {city.name}. Ready in {turns_to_build} turn(s).")
 
@@ -1222,6 +1358,95 @@ class Game:
             except ValueError as error:
                 print(error)
 
+        def _parse_tile_coordinates(raw_value: str, label: str = 'Target tile'):
+            parts = str(raw_value).strip().split()
+            if len(parts) != 2:
+                raise ValueError(f'{label} must be provided as two integers: x y')
+            if not parts[0].lstrip('-').isdigit() or not parts[1].lstrip('-').isdigit():
+                raise ValueError(f'{label} must be numeric coordinates.')
+            return int(parts[0]), int(parts[1])
+
+        def _build_split_counts(regiment: Regiment):
+            split_counts = {}
+            for unit_type in ('infantry', 'ranged', 'cavalry', 'siege'):
+                percent_raw = input(
+                    f'Enter percent of {unit_type} to move into the split regiment '
+                    f'(0-100, current={getattr(regiment, unit_type)}): '
+                ).strip()
+                try:
+                    percent = float(percent_raw)
+                except ValueError as error:
+                    raise ValueError(f'{unit_type.capitalize()} split percent must be a number.') from error
+                if percent < 0 or percent > 100:
+                    raise ValueError(f'{unit_type.capitalize()} split percent must be between 0 and 100.')
+                split_counts[unit_type] = math.floor(getattr(regiment, unit_type) * (percent / 100))
+            return split_counts
+
+        def split_regiment_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
+            regiment_input = input('Enter regiment id or exact name to split: ').strip()
+            try:
+                regiment = _resolve_owned_regiment(regiment_input, selected_player.id)
+                split_counts = _build_split_counts(regiment)
+                print(
+                    'New regiment composition: '
+                    f"infantry={split_counts['infantry']}, ranged={split_counts['ranged']}, "
+                    f"cavalry={split_counts['cavalry']}, siege={split_counts['siege']}"
+                )
+                target_x, target_y = _parse_tile_coordinates(
+                    input('Enter adjacent tile for the split regiment as x y: '),
+                    label='Split tile',
+                )
+                default_name = f'{regiment.name} Detachment'
+                new_regiment_name = input(
+                    f'Enter split regiment name (default: {default_name}): '
+                ).strip() or default_name
+                split_regiment = self.map.split_regiment(
+                    regiment.id,
+                    target_x,
+                    target_y,
+                    split_counts,
+                    new_name=new_regiment_name,
+                )
+                print(
+                    f"Split {regiment.symbol()} and formed {split_regiment.symbol()} at ({target_x}, {target_y}). "
+                    f'Both regiments have spent their movement for this turn.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def combine_regiments_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
+            source_input = input('Enter regiment id or exact name to combine from: ').strip()
+            target_input = input('Enter regiment id or exact name to combine into: ').strip()
+            try:
+                source_regiment = _resolve_owned_regiment(source_input, selected_player.id)
+                target_regiment = _resolve_owned_regiment(target_input, selected_player.id)
+                combined_regiment = self.map.combine_regiments(source_regiment.id, target_regiment.id)
+                print(
+                    f'Combined {source_regiment.symbol()} into {combined_regiment.symbol()} at '
+                    f'{self.map.get_regiment_location(combined_regiment.id)}. '
+                    f'{combined_regiment.symbol()} kept its id and name and has spent its movement for this turn.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def combine_or_split_regiment():
+            action_menu = ConsoleMenu()
+            action_menu.add_option('Split Regiment', split_regiment_action, 's')
+            action_menu.add_option('Combine Regiments', combine_regiments_action, 'c')
+            action_menu.add_option('Cancel', lambda: None, 'q')
+            print('---COMBINE / SPLIT REGIMENT---')
+            action_menu.prompt_and_select()
+
         def move_regiment():
             selected_player = self.get_selected_player()
             if selected_player is None:
@@ -1241,16 +1466,8 @@ class Game:
                 print(f'Regiment {regiment_id} belongs to another empire. You may only move {selected_player.name} regiments.')
                 return
 
-            target_raw = input('Enter target tile as x y: ').strip().split()
-            if len(target_raw) != 2:
-                print('Target must be provided as two integers: x y')
-                return
-            if not target_raw[0].lstrip('-').isdigit() or not target_raw[1].lstrip('-').isdigit():
-                print('Target must be numeric coordinates.')
-                return
-            target_x, target_y = int(target_raw[0]), int(target_raw[1])
-
             try:
+                target_x, target_y = _parse_tile_coordinates(input('Enter target tile as x y: '))
                 self.map.move_regiment(regiment_id, target_x, target_y)
                 print(f'Moved {regiment.symbol()} to ({target_x}, {target_y}).')
             except ValueError as error:
@@ -1285,6 +1502,7 @@ class Game:
             player_menu.add_option('Create Regiment', create_regiment_order, 'r')
             player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
+            player_menu.add_option('Combine/Split Regiment', combine_or_split_regiment, 's')
             player_menu.add_option('Attack With Regiment', attack_with_regiment, 'a')
             player_menu.add_option('Inspect Regiment By Id', print_regiment_metadata_by_id, 'i')
             player_menu.add_option('Next Turn', advance_turn, 't')

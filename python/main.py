@@ -93,6 +93,7 @@ class Regiment:
     }
     BASE_BATTLE_RATE = 0.25
     FORCE_SIZE_EXPONENT = 0.5
+    RANGED_ATTACK_RADIUS = 2
 
     CITY_ATTACK_WEIGHTS = {
         'infantry': 0.8,
@@ -167,6 +168,15 @@ class Regiment:
 
     def reset_turn_movement(self):
         self.movement_spent_this_turn = 0
+
+    def has_ranged_attack_capability(self):
+        return self.ranged > 0 or getattr(self, 'navy', 0) > 0
+
+    def attack_range(self):
+        return self.RANGED_ATTACK_RADIUS if self.has_ranged_attack_capability() else 1
+
+    def can_attack_distance(self, distance: int):
+        return 0 <= distance <= self.attack_range()
 
     def recalculate_attack_scores(self):
         self.regiment_attack_score = self._compute_weighted_score(
@@ -254,6 +264,11 @@ class Map:
         if tile is None or tile.regiment_id is None:
             return None
         return self.get_regiment(tile.regiment_id)
+
+    def get_tile_distance(self, origin: tuple[int, int], target: tuple[int, int]):
+        if origin is None or target is None:
+            raise ValueError('Both origin and target locations are required')
+        return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
     def add_regiment(self, regiment: Regiment, x: int, y: int):
         if regiment.owner_id not in self.players:
@@ -378,6 +393,35 @@ class Map:
             'defeated_b': defeated_b,
         }
 
+    def attack_regiment(self, attacker_id: int, defender_id: int) -> dict:
+        if attacker_id == defender_id:
+            raise ValueError('A regiment cannot attack itself')
+
+        attacker = self.get_regiment(attacker_id)
+        if attacker is None:
+            raise ValueError(f'Regiment {attacker_id} does not exist')
+        defender = self.get_regiment(defender_id)
+        if defender is None:
+            raise ValueError(f'Regiment {defender_id} does not exist')
+
+        attacker_location = self.get_regiment_location(attacker_id)
+        defender_location = self.get_regiment_location(defender_id)
+        if attacker_location is None:
+            raise ValueError(f'Regiment {attacker_id} is not on the map')
+        if defender_location is None:
+            raise ValueError(f'Regiment {defender_id} is not on the map')
+
+        attack_distance = self.get_tile_distance(attacker_location, defender_location)
+        if not attacker.can_attack_distance(attack_distance):
+            raise ValueError(
+                f'Regiment {attacker_id} may attack up to {attacker.attack_range()} tile(s), '
+                f'but Regiment {defender_id} is {attack_distance} tile(s) away'
+            )
+
+        result = self.resolve_regiment_battle(attacker_id, defender_id)
+        result['attack_distance'] = attack_distance
+        return result
+
     def resolve_siege(self, regiment_id: int = None, city_id: int = None) -> dict:
         if city_id is None:
             raise ValueError('City id is required')
@@ -396,14 +440,28 @@ class Map:
             regiment = self.get_regiment(regiment_id)
             if regiment is None:
                 raise ValueError(f'Regiment {regiment_id} does not exist')
+            if regiment.total_units() == 0:
+                raise ValueError(f'Regiment {regiment_id} has no units remaining')
 
         resistance_before = city.siege_resistance
         sacked = False
         previous_owner_id = city.owner_id
         regiment_location = self.get_regiment_location(regiment_id) if regiment_id is not None else None
+        attack_distance = self.get_tile_distance(regiment_location, city_location) if regiment_location is not None else None
+        if (
+            regiment is not None and
+            regiment_location is not None and
+            regiment.owner_id != city.owner_id and
+            not regiment.can_attack_distance(attack_distance)
+        ):
+            raise ValueError(
+                f'Regiment {regiment_id} may attack up to {regiment.attack_range()} tile(s), '
+                f'but City {city_id} is {attack_distance} tile(s) away'
+            )
         is_besieging = (
             regiment is not None and
-            regiment_location == city_location and
+            regiment_location is not None and
+            regiment.can_attack_distance(attack_distance) and
             regiment.owner_id != city.owner_id
         )
 
@@ -442,6 +500,23 @@ class Map:
             result['previous_owner_id'] = previous_owner_id
             result['new_owner_id'] = city.owner_id
         return result
+
+    def attack_city(self, regiment_id: int, city_id: int) -> dict:
+        regiment = self.get_regiment(regiment_id)
+        if regiment is None:
+            raise ValueError(f'Regiment {regiment_id} does not exist')
+
+        city = self.get_city(city_id)
+        if city is None:
+            raise ValueError(f'City {city_id} does not exist')
+        if regiment.owner_id == city.owner_id:
+            raise ValueError(f'Regiment {regiment_id} and City {city_id} belong to the same owner')
+
+        attack_result = self.resolve_siege(regiment_id=regiment_id, city_id=city_id)
+        regiment_location = self.get_regiment_location(regiment_id)
+        city_location = self.get_city_location(city_id)
+        attack_result['attack_distance'] = self.get_tile_distance(regiment_location, city_location)
+        return attack_result
 
     def reset_regiment_movement_for_new_turn(self):
         for regiment in self.regiments.values():
@@ -501,7 +576,10 @@ class Map:
         print('REGIMENT:')
         print(f'  id={regiment.id} | name={regiment.name} | owner={owner_name} | location={location_text}')
         print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, heroes={regiment.hero_count()}')
-        print(f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_city={regiment.city_attack_score} | move_range={regiment.movement_range()}')
+        print(
+            f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_city={regiment.city_attack_score} '
+            f'| move_range={regiment.movement_range()} | attack_range={regiment.attack_range()}'
+        )
         if regiment.heroes:
             print(f'  heroes: {", ".join(regiment.heroes)}')
         print('')
@@ -992,6 +1070,158 @@ class Game:
             })
             print(f"Queued regiment '{regiment_name}' for {owner_name} from {city.name}. Ready in {turns_to_build} turn(s).")
 
+        def _normalize_lookup_name(value: str):
+            return str(value).strip().lower()
+
+        def _find_regiments_by_name(name: str, owner_id: int = None):
+            normalized_name = _normalize_lookup_name(name)
+            if not normalized_name:
+                return []
+            return [
+                regiment for regiment in self.map.regiments.values()
+                if _normalize_lookup_name(regiment.name) == normalized_name
+                and (owner_id is None or regiment.owner_id == owner_id)
+            ]
+
+        def _find_cities_by_name(name: str, owner_id: int = None):
+            normalized_name = _normalize_lookup_name(name)
+            if not normalized_name:
+                return []
+            return [
+                city for city in self.map.cities.values()
+                if _normalize_lookup_name(city.name) == normalized_name
+                and (owner_id is None or city.owner_id == owner_id)
+            ]
+
+        def _resolve_owned_regiment(selection: str, owner_id: int):
+            normalized = str(selection).strip()
+            if not normalized:
+                raise ValueError('Attacking regiment selection cannot be empty.')
+
+            if normalized.isdigit():
+                regiment_id = int(normalized)
+                regiment = self.map.get_regiment(regiment_id)
+                if regiment is None:
+                    raise ValueError(f'Regiment {regiment_id} does not exist.')
+                if regiment.owner_id != owner_id:
+                    raise ValueError(f'Regiment {regiment_id} belongs to another empire.')
+                return regiment
+
+            matches = _find_regiments_by_name(normalized, owner_id=owner_id)
+            if not matches:
+                raise ValueError(f'No regiment named "{normalized}" belongs to your empire.')
+            if len(matches) > 1:
+                raise ValueError(f'Multiple regiments named "{normalized}" belong to your empire. Use the regiment id instead.')
+            return matches[0]
+
+        def _resolve_attack_target(selection: str, attacker_owner_id: int):
+            normalized = str(selection).strip()
+            if not normalized:
+                raise ValueError('Target selection cannot be empty.')
+
+            compact = normalized.replace(' ', '')
+            target_token = compact.upper()
+            if target_token.startswith('*C') and compact[2:].isdigit():
+                city_id = int(compact[2:])
+                city = self.map.get_city(city_id)
+                if city is None:
+                    raise ValueError(f'City {city_id} does not exist.')
+                if not city.is_capital:
+                    raise ValueError(f'City {city_id} is not a capital.')
+                if city.owner_id == attacker_owner_id:
+                    raise ValueError('Friendly fire is not allowed.')
+                return {'kind': 'city', 'entity': city}
+
+            if target_token.startswith('C') and compact[1:].isdigit():
+                city_id = int(compact[1:])
+                city = self.map.get_city(city_id)
+                if city is None:
+                    raise ValueError(f'City {city_id} does not exist.')
+                if city.is_capital:
+                    raise ValueError(f'City {city_id} is a capital. Target it as *C{city_id}.')
+                if city.owner_id == attacker_owner_id:
+                    raise ValueError('Friendly fire is not allowed.')
+                return {'kind': 'city', 'entity': city}
+
+            if target_token.startswith('R') and compact[1:].isdigit():
+                regiment_id = int(compact[1:])
+                regiment = self.map.get_regiment(regiment_id)
+                if regiment is None:
+                    raise ValueError(f'Regiment {regiment_id} does not exist.')
+                if regiment.owner_id == attacker_owner_id:
+                    raise ValueError('Friendly fire is not allowed.')
+                return {'kind': 'regiment', 'entity': regiment}
+
+            regiment_matches = [
+                regiment for regiment in _find_regiments_by_name(normalized)
+                if regiment.owner_id != attacker_owner_id
+            ]
+            city_matches = [
+                city for city in _find_cities_by_name(normalized)
+                if city.owner_id != attacker_owner_id
+            ]
+            target_matches = (
+                [{'kind': 'regiment', 'entity': regiment} for regiment in regiment_matches] +
+                [{'kind': 'city', 'entity': city} for city in city_matches]
+            )
+            if not target_matches:
+                raise ValueError(f'No enemy regiment or city named "{normalized}" exists.')
+            if len(target_matches) > 1:
+                raise ValueError(f'Multiple enemy targets named "{normalized}" exist. Use R#, C#, or *C# instead.')
+            return target_matches[0]
+
+        def attack_with_regiment():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
+            attacker_input = input('Enter attacking regiment id or exact name: ').strip()
+            try:
+                attacker = _resolve_owned_regiment(attacker_input, selected_player.id)
+            except ValueError as error:
+                print(error)
+                return
+
+            target_input = input('Enter target (R#, C#, *C#, or exact name): ').strip()
+            try:
+                target = _resolve_attack_target(target_input, attacker.owner_id)
+                if target['kind'] == 'regiment':
+                    defending_regiment = target['entity']
+                    result = self.map.attack_regiment(attacker.id, defending_regiment.id)
+                    attacker_losses = sum(result['casualties_a'].values())
+                    defender_losses = sum(result['casualties_b'].values())
+                    print(
+                        f'{attacker.symbol()} attacked {defending_regiment.symbol()} from '
+                        f'{result["attack_distance"]} tile(s).'
+                    )
+                    print(
+                        f'Attacker losses: {attacker_losses} | Defender losses: {defender_losses} | '
+                        f'Remaining units: attacker={result["remaining_units_a"]}, defender={result["remaining_units_b"]}'
+                    )
+                    if result['defeated_a']:
+                        print(f'{attacker.name} was destroyed.')
+                    if result['defeated_b']:
+                        print(f'{defending_regiment.name} was destroyed.')
+                else:
+                    target_city = target['entity']
+                    city_type = 'Capital' if target_city.is_capital else 'City'
+                    result = self.map.attack_city(attacker.id, target_city.id)
+                    print(
+                        f'{attacker.symbol()} attacked {city_type} {target_city.id} ({target_city.name}) from '
+                        f'{result["attack_distance"]} tile(s).'
+                    )
+                    print(
+                        f'Siege resistance: {result["resistance_before"]} -> '
+                        f'{result["resistance_after"]} / {result["max_resistance"]}'
+                    )
+                    if result['sacked']:
+                        new_owner = self.map.get_player(result['new_owner_id'])
+                        new_owner_name = new_owner.name if new_owner is not None else f'Player {result["new_owner_id"]}'
+                        print(f'{city_type} {target_city.name} was captured by {new_owner_name}.')
+            except ValueError as error:
+                print(error)
+
         def move_regiment():
             selected_player = self.get_selected_player()
             if selected_player is None:
@@ -1055,6 +1285,7 @@ class Game:
             player_menu.add_option('Create Regiment', create_regiment_order, 'r')
             player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
+            player_menu.add_option('Attack With Regiment', attack_with_regiment, 'a')
             player_menu.add_option('Inspect Regiment By Id', print_regiment_metadata_by_id, 'i')
             player_menu.add_option('Next Turn', advance_turn, 't')
             player_menu.add_option('Quit to Main Menu', quit_to_main_menu, 'q')

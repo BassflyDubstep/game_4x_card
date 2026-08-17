@@ -18,21 +18,32 @@ class Player:
 class City:
 
     _city_symbols = {'City': 'C', 'Capital': '*C'}
+    DEFAULT_LINE_OF_SIGHT_RADIUS = 3
+    CAPITAL_LINE_OF_SIGHT_BONUS = 1
+    DEFAULT_INFLUENCE_ANCHORS = {0: 1.0, 1: 0.8, 2: 0.4, 3: 0.1}
+    CAPITAL_INFLUENCE_ANCHORS = {0: 1.0, 1: 0.9, 2: 0.5, 3: 0.2, 4: 0.1}
     RESISTANCE_MULTIPLIER = 5.0
     DEFENSE_SCALE = 1.0
     BASE_SIEGE_RATE = 0.20
     SIEGE_REGEN_RATE = 0.15
     SACK_POPULATION_PENALTY = 0.30
     
-    def __init__(self, id: int, name: str, owner_id: int, 
+    def __init__(self, id: int, name: str, owner_id: int,
                  population: int = 1000, is_capital: bool = False,
-                 defense_score: float = None):
+                 defense_score: float = None, line_of_sight_radius: int = None):
         self.id = id
         self.name = name
         self.owner_id = owner_id
         self.population = population
         self.is_capital = is_capital
         self.defense_score = defense_score if defense_score is not None else self._default_defense_score()
+        self.line_of_sight_radius = self._validate_line_of_sight_radius(
+            self.DEFAULT_LINE_OF_SIGHT_RADIUS if line_of_sight_radius is None else line_of_sight_radius
+        )
+        self.influence_radius_bonus = 0
+        self.influence_score_bonus = 0.0
+        self.influence_score_multiplier = 1.0
+        self.influence_profile_anchors = self._default_influence_anchors()
         self.max_siege_resistance = self._default_max_siege_resistance()
         self.siege_resistance = self.max_siege_resistance
         self._update_symbol()
@@ -40,6 +51,7 @@ class City:
     def mark_as_capital(self):
         self.is_capital = True
         self.defense_score = self._default_defense_score()
+        self.influence_profile_anchors = self._default_influence_anchors()
         self.max_siege_resistance = self._default_max_siege_resistance()
         self.siege_resistance = self.max_siege_resistance
         self._update_symbol()
@@ -50,6 +62,87 @@ class City:
 
     def _default_max_siege_resistance(self):
         return round(self.defense_score * self.RESISTANCE_MULTIPLIER, 2)
+
+    def _validate_line_of_sight_radius(self, radius: int):
+        if not isinstance(radius, int) or radius < 0:
+            raise ValueError('City line of sight radius must be a non-negative integer')
+        return radius
+
+    def _default_influence_anchors(self):
+        return dict(
+            self.CAPITAL_INFLUENCE_ANCHORS if self.is_capital else self.DEFAULT_INFLUENCE_ANCHORS
+        )
+
+    def effective_line_of_sight_radius(self):
+        return max(
+            0,
+            self.line_of_sight_radius +
+            self.influence_radius_bonus +
+            (self.CAPITAL_LINE_OF_SIGHT_BONUS if self.is_capital else 0),
+        )
+
+    def get_influence_profile(self):
+        return self._build_influence_profile(
+            self.effective_line_of_sight_radius(),
+            self.influence_profile_anchors,
+        )
+
+    def get_influence_at_distance(self, distance: int):
+        if not isinstance(distance, int) or distance < 0:
+            raise ValueError('Influence distance must be a non-negative integer')
+
+        influence_profile = self.get_influence_profile()
+        base_score = influence_profile.get(distance, 0.0)
+        modified_score = (base_score + self.influence_score_bonus) * self.influence_score_multiplier
+        return max(0.0, min(1.0, round(modified_score, 4)))
+
+    @staticmethod
+    def _build_influence_profile(max_radius: int, anchors: dict[int, float]):
+        if max_radius < 0:
+            return {}
+
+        normalized_anchors = {
+            distance: max(0.0, min(1.0, float(score)))
+            for distance, score in anchors.items()
+            if isinstance(distance, int) and distance >= 0
+        }
+        if 0 not in normalized_anchors:
+            normalized_anchors[0] = 1.0
+
+        anchor_distances = sorted(normalized_anchors)
+        last_anchor_distance = anchor_distances[-1]
+        last_anchor_value = normalized_anchors[last_anchor_distance]
+        profile = {}
+
+        for distance in range(max_radius + 1):
+            if distance in normalized_anchors:
+                profile[distance] = round(normalized_anchors[distance], 4)
+                continue
+
+            lower_distance = max(d for d in anchor_distances if d < distance)
+            upper_candidates = [d for d in anchor_distances if d > distance]
+            if upper_candidates:
+                upper_distance = min(upper_candidates)
+                lower_position = math.log(lower_distance + 1)
+                upper_position = math.log(upper_distance + 1)
+                current_position = math.log(distance + 1)
+                if math.isclose(lower_position, upper_position):
+                    interpolated = normalized_anchors[lower_distance]
+                else:
+                    interpolation_ratio = (
+                        (current_position - lower_position) /
+                        (upper_position - lower_position)
+                    )
+                    interpolated = normalized_anchors[lower_distance] + (
+                        (normalized_anchors[upper_distance] - normalized_anchors[lower_distance]) *
+                        interpolation_ratio
+                    )
+            else:
+                tail_distance = distance - last_anchor_distance
+                interpolated = last_anchor_value / (1 + math.log(tail_distance + 1, 2))
+
+            profile[distance] = round(max(0.0, min(1.0, interpolated)), 4)
+        return profile
 
     def _update_symbol(self):
         self.symbol = f'{"*C" if self.is_capital else "C"}{self.id}({self.owner_id})'
@@ -78,6 +171,9 @@ class Tile:
         self.passable_foot = self._allowable_types[type]['passable_foot']
         self.passable_water = self._allowable_types[type]['passable_water']
         self.symbol = self._allowable_types[type]['symbol']
+        self.influence_scores: dict[int, float] = {}
+        self.influence_owner_id: int | None = None
+        self.is_influence_contested = False
 
 class Card:
 
@@ -94,6 +190,12 @@ class Regiment:
     BASE_BATTLE_RATE = 0.25
     FORCE_SIZE_EXPONENT = 0.5
     RANGED_ATTACK_RADIUS = 2
+    DEFAULT_LINE_OF_SIGHT_RADIUS = 1
+    TILE_INFLUENCE_SCORE = 1.0
+    CITY_INFLUENCE_SUPPORT_BONUS = 0.25
+    CITY_INFLUENCE_DISRUPTION_PENALTY = 0.25
+    HERO_INFLUENCE_BONUS = 0.25
+    HERO_INFLUENCE_RADIUS = 1
 
     CITY_ATTACK_WEIGHTS = {
         'infantry': 0.8,
@@ -104,7 +206,8 @@ class Regiment:
 
     def __init__(self, id: int = None, name: str = 'Unnamed Regiment', owner_id: int = None,
                  infantry: int = 0, ranged: int = 0, cavalry: int = 0,
-                 siege: int = 0, heroes: list[str] = None):
+                 siege: int = 0, heroes: list[str] = None,
+                 line_of_sight_radius: int = None):
         self.id = id
         self.name = name
         self.owner_id = owner_id
@@ -113,6 +216,16 @@ class Regiment:
         self.cavalry = self._validate_unit_count(cavalry, 'cavalry')
         self.siege = self._validate_unit_count(siege, 'siege')
         self.heroes = list(heroes) if heroes is not None else []
+        self.line_of_sight_radius = self._validate_line_of_sight_radius(
+            self.DEFAULT_LINE_OF_SIGHT_RADIUS if line_of_sight_radius is None else line_of_sight_radius
+        )
+        self.influence_radius_bonus = 0
+        self.tile_influence_score = self.TILE_INFLUENCE_SCORE
+        self.city_influence_support_bonus = self.CITY_INFLUENCE_SUPPORT_BONUS
+        self.city_influence_disruption_penalty = self.CITY_INFLUENCE_DISRUPTION_PENALTY
+        self.hero_influence_bonus = self.HERO_INFLUENCE_BONUS
+        self.hero_influence_radius = self.HERO_INFLUENCE_RADIUS
+        self.influence_score_multiplier = 1.0
 
         self.regiment_attack_score = 0.0
         self.city_attack_score = 0.0
@@ -125,11 +238,22 @@ class Regiment:
             raise ValueError(f'{unit_type} count must be a non-negative integer')
         return value
 
+    def _validate_line_of_sight_radius(self, radius: int):
+        if not isinstance(radius, int) or radius < 0:
+            raise ValueError('Regiment line of sight radius must be a non-negative integer')
+        return radius
+
     def total_units(self):
         return self.infantry + self.ranged + self.cavalry + self.siege
 
     def hero_count(self):
         return len(self.heroes)
+
+    def effective_line_of_sight_radius(self):
+        return max(0, self.line_of_sight_radius + self.influence_radius_bonus)
+
+    def has_hero_influence(self):
+        return self.hero_count() > 0 and self.hero_influence_bonus > 0
 
     def update_composition(self, infantry: int = None, ranged: int = None,
                            cavalry: int = None, siege: int = None):
@@ -220,6 +344,12 @@ class Regiment:
 
 class Map:
 
+    MAX_INFLUENCE_SCORE = 1.0
+    PLAYER_TOTAL_INFLUENCE_TILE_WEIGHT = 100.0
+    INFLUENCE_EPSILON = 0.0001
+    MIN_VISIBLE_INFLUENCE_SCORE = 0.01
+    MIN_VISIBLE_INFLUENCE_COLOR_BLEND = 0.4
+
     def __init__(self, width: int = 10, height: int = 10,
                  default_tile: str = 'grass'):
         self.width = width
@@ -229,20 +359,44 @@ class Map:
         self.players: dict[int, Player] = {}
         self.cities: dict[int, City] = {}
         self.regiments: dict[int, Regiment] = {}
+        self.player_discovered_tiles: dict[int, set[tuple[int, int]]] = {}
         self.next_regiment_id = 1
         self.resolved_regiment_battles_this_turn: set[tuple[int, int]] = set()
         self.resolved_sieges_this_turn: set[int] = set()
 
     def add_player(self, player: Player):
         self.players[player.id] = player
+        self._ensure_player_discovery_entry(player.id)
+        self.recalculate_tile_influence()
 
     def add_city(self, city: City):
         if city.owner_id not in self.players:
             raise ValueError(f'City {city.id} references missing player {city.owner_id}')
         self.cities[city.id] = city
+        self.recalculate_tile_influence()
+        if self.get_city_location(city.id) is not None:
+            self.update_player_discovery(city.owner_id)
 
     def get_player(self, player_id: int):
         return self.players.get(player_id)
+
+    def get_player_total_influence_score(self, player_id: int):
+        if player_id not in self.players:
+            raise ValueError(f'Player {player_id} does not exist')
+
+        total_score = 0.0
+        for tile in self.tiles.values():
+            total_score += (
+                tile.influence_scores.get(player_id, 0.0) *
+                self.PLAYER_TOTAL_INFLUENCE_TILE_WEIGHT
+            )
+        return round(total_score, 2)
+
+    def get_player_influence_rankings(self):
+        rankings = []
+        for player in self.players.values():
+            rankings.append((player, self.get_player_total_influence_score(player.id)))
+        return sorted(rankings, key=lambda entry: (-entry[1], entry[0].id))
 
     def get_city(self, city_id: int):
         return self.cities.get(city_id)
@@ -279,6 +433,192 @@ class Map:
             raise ValueError('Both origin and target locations are required')
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
+    def _ensure_player_discovery_entry(self, player_id: int):
+        if player_id not in self.player_discovered_tiles:
+            self.player_discovered_tiles[player_id] = set()
+        return self.player_discovered_tiles[player_id]
+
+    def get_tiles_in_radius(self, origin: tuple[int, int], radius: int):
+        if origin is None:
+            return set()
+        if not isinstance(radius, int) or radius < 0:
+            raise ValueError('Line of sight radius must be a non-negative integer')
+
+        tiles_in_radius = set()
+        origin_x, origin_y = origin
+        min_x = max(0, origin_x - radius)
+        max_x = min(self.width - 1, origin_x + radius)
+        min_y = max(0, origin_y - radius)
+        max_y = min(self.height - 1, origin_y + radius)
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                tiles_in_radius.add((x, y))
+        return tiles_in_radius
+
+    def _clamp_influence_score(self, score: float):
+        return round(max(0.0, min(self.MAX_INFLUENCE_SCORE, float(score))), 4)
+
+    def _set_tile_influence(self, tile: Tile, influence_scores: dict[int, float]):
+        normalized_scores = {
+            player_id: self._clamp_influence_score(influence_scores.get(player_id, 0.0))
+            for player_id in self.players
+        }
+        tile.influence_scores = normalized_scores
+
+        if not normalized_scores:
+            tile.influence_owner_id = None
+            tile.is_influence_contested = False
+            return
+
+        highest_score = max(normalized_scores.values(), default=0.0)
+        if highest_score <= self.INFLUENCE_EPSILON:
+            tile.influence_owner_id = None
+            tile.is_influence_contested = False
+            return
+
+        winning_players = [
+            player_id for player_id, score in normalized_scores.items()
+            if abs(score - highest_score) <= self.INFLUENCE_EPSILON
+        ]
+        tile.influence_owner_id = winning_players[0] if len(winning_players) == 1 else None
+        tile.is_influence_contested = len(winning_players) > 1
+
+    def recalculate_tile_influence(self):
+        if not self.tiles:
+            return
+
+        city_influence_by_tile = {
+            position: {player_id: 0.0 for player_id in self.players}
+            for position in self.tiles
+        }
+        regiment_support_by_tile = {
+            position: {player_id: 0.0 for player_id in self.players}
+            for position in self.tiles
+        }
+        regiment_disruption_by_tile = {
+            position: {player_id: 0.0 for player_id in self.players}
+            for position in self.tiles
+        }
+        hero_influence_by_tile = {
+            position: {player_id: 0.0 for player_id in self.players}
+            for position in self.tiles
+        }
+        regiment_tile_control_by_tile = {
+            position: {player_id: 0.0 for player_id in self.players}
+            for position in self.tiles
+        }
+
+        for city in self.cities.values():
+            city_location = self.get_city_location(city.id)
+            if city_location is None or city.owner_id not in self.players:
+                continue
+
+            for position in self.get_tiles_in_radius(city_location, city.effective_line_of_sight_radius()):
+                distance = self.get_tile_distance(city_location, position)
+                influence_score = city.get_influence_at_distance(distance)
+                if influence_score <= self.INFLUENCE_EPSILON:
+                    continue
+                city_influence_by_tile[position][city.owner_id] = self._clamp_influence_score(
+                    city_influence_by_tile[position][city.owner_id] + influence_score
+                )
+
+        for regiment in self.regiments.values():
+            regiment_location = self.get_regiment_location(regiment.id)
+            if regiment_location is None or regiment.owner_id not in self.players:
+                continue
+
+            for position in self.get_tiles_in_radius(regiment_location, regiment.effective_line_of_sight_radius()):
+                if city_influence_by_tile[position].get(regiment.owner_id, 0.0) > self.INFLUENCE_EPSILON:
+                    regiment_support_by_tile[position][regiment.owner_id] = self._clamp_influence_score(
+                        regiment_support_by_tile[position][regiment.owner_id] +
+                        (regiment.city_influence_support_bonus * regiment.influence_score_multiplier)
+                    )
+
+                for player_id in self.players:
+                    if player_id == regiment.owner_id:
+                        continue
+                    if city_influence_by_tile[position].get(player_id, 0.0) <= self.INFLUENCE_EPSILON:
+                        continue
+                    regiment_disruption_by_tile[position][player_id] = self._clamp_influence_score(
+                        regiment_disruption_by_tile[position][player_id] +
+                        (regiment.city_influence_disruption_penalty * regiment.influence_score_multiplier)
+                    )
+
+            if regiment.has_hero_influence():
+                for position in self.get_tiles_in_radius(regiment_location, regiment.hero_influence_radius):
+                    hero_influence_by_tile[position][regiment.owner_id] = self._clamp_influence_score(
+                        hero_influence_by_tile[position][regiment.owner_id] +
+                        (regiment.hero_influence_bonus * regiment.influence_score_multiplier)
+                    )
+
+            regiment_tile_control_by_tile[regiment_location][regiment.owner_id] = self._clamp_influence_score(
+                regiment_tile_control_by_tile[regiment_location][regiment.owner_id] +
+                (regiment.tile_influence_score * regiment.influence_score_multiplier)
+            )
+
+        for position, tile in self.tiles.items():
+            total_influence = {}
+            for player_id in self.players:
+                influence_score = (
+                    city_influence_by_tile[position][player_id] +
+                    regiment_support_by_tile[position][player_id] +
+                    hero_influence_by_tile[position][player_id] -
+                    regiment_disruption_by_tile[position][player_id]
+                )
+                influence_score = self._clamp_influence_score(influence_score)
+                influence_score = max(
+                    influence_score,
+                    regiment_tile_control_by_tile[position][player_id],
+                )
+                total_influence[player_id] = self._clamp_influence_score(influence_score)
+            self._set_tile_influence(tile, total_influence)
+
+    def get_player_visible_tiles(self, player_id: int):
+        if player_id not in self.players:
+            return set()
+
+        visible_tiles = set()
+        for city in self.cities.values():
+            if city.owner_id != player_id:
+                continue
+            visible_tiles.update(self.get_tiles_in_radius(
+                self.get_city_location(city.id),
+                city.effective_line_of_sight_radius(),
+            ))
+
+        for regiment in self.regiments.values():
+            if regiment.owner_id != player_id:
+                continue
+            visible_tiles.update(self.get_tiles_in_radius(
+                self.get_regiment_location(regiment.id),
+                regiment.effective_line_of_sight_radius(),
+            ))
+        return visible_tiles
+
+    def get_player_discovered_tiles(self, player_id: int):
+        return self._ensure_player_discovery_entry(player_id)
+
+    def update_player_discovery(self, player_id: int):
+        discovered_tiles = self._ensure_player_discovery_entry(player_id)
+        discovered_tiles.update(self.get_player_visible_tiles(player_id))
+        return discovered_tiles
+
+    def refresh_all_player_discovery(self):
+        self.recalculate_tile_influence()
+        for player_id in self.players:
+            self.update_player_discovery(player_id)
+
+    def is_tile_visible_to_player(self, x: int, y: int, player_id: int):
+        return (x, y) in self.get_player_visible_tiles(player_id)
+
+    def is_city_visible_to_player(self, city_id: int, player_id: int):
+        location = self.get_city_location(city_id)
+        return location is not None and self.is_tile_visible_to_player(location[0], location[1], player_id)
+
+    def is_regiment_visible_to_player(self, regiment_id: int, player_id: int):
+        location = self.get_regiment_location(regiment_id)
+        return location is not None and self.is_tile_visible_to_player(location[0], location[1], player_id)
+
     def add_regiment(self, regiment: Regiment, x: int, y: int):
         if regiment.owner_id not in self.players:
             raise ValueError(f'Regiment owner {regiment.owner_id} does not exist')
@@ -300,6 +640,8 @@ class Map:
 
         self.regiments[regiment.id] = regiment
         tile.regiment_id = regiment.id
+        self.recalculate_tile_influence()
+        self.update_player_discovery(regiment.owner_id)
 
     def move_regiment(self, regiment_id: int, target_x: int, target_y: int):
         regiment = self.get_regiment(regiment_id)
@@ -330,6 +672,8 @@ class Map:
         self.tiles[start].regiment_id = None
         target_tile.regiment_id = regiment_id
         regiment.record_movement(distance)
+        self.recalculate_tile_influence()
+        self.update_player_discovery(regiment.owner_id)
 
     def split_regiment(self, regiment_id: int, target_x: int, target_y: int,
                        split_counts: dict[str, int], new_name: str = None):
@@ -399,6 +743,7 @@ class Map:
         )
         regiment.mark_reorganized_this_turn()
         split_regiment.mark_reorganized_this_turn()
+        self.recalculate_tile_influence()
         return split_regiment
 
     def combine_regiments(self, source_regiment_id: int, target_regiment_id: int):
@@ -445,6 +790,7 @@ class Map:
         target_regiment.recalculate_attack_scores()
         self._remove_regiment_from_map(source_regiment_id)
         target_regiment.mark_reorganized_this_turn()
+        self.recalculate_tile_influence()
         return target_regiment
 
     def resolve_regiment_battle(self, regiment_a_id: int, regiment_b_id: int) -> dict:
@@ -602,6 +948,8 @@ class Map:
                 city.population = round(city.population * (1 - City.SACK_POPULATION_PENALTY))
                 city.siege_resistance = city.max_siege_resistance
                 city._update_symbol()
+                self.recalculate_tile_influence()
+                self.update_player_discovery(city.owner_id)
                 sacked = True
         else:
             city.siege_resistance = round(
@@ -684,6 +1032,7 @@ class Map:
         if location is not None:
             self.tiles[location].regiment_id = None
         self.regiments.pop(regiment_id, None)
+        self.recalculate_tile_influence()
 
     def print_regiment_metadata(self, regiment: Regiment):
         if regiment is None:
@@ -703,11 +1052,15 @@ class Map:
         print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, heroes={regiment.hero_count()}')
         print(
             f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_city={regiment.city_attack_score} '
-            f'| move_range={regiment.movement_range()} | attack_range={regiment.attack_range()}'
+            f'| move_range={regiment.movement_range()} | attack_range={regiment.attack_range()} '
+            f'| line_of_sight={regiment.effective_line_of_sight_radius()}'
         )
         if regiment.heroes:
             print(f'  heroes: {", ".join(regiment.heroes)}')
         print('')
+
+    def _normalize_player_color_name(self, player_color: str):
+        return str(player_color).strip().lower().replace('_', '').replace('-', '')
 
     def _get_player_color_code(self, player_color: str):
         color_map = {
@@ -728,24 +1081,84 @@ class Map:
             'lightcyan': Fore.LIGHTCYAN_EX,
             'lightwhite': Fore.LIGHTWHITE_EX,
         }
-        normalized = str(player_color).strip().lower().replace('_', '').replace('-', '')
+        normalized = self._normalize_player_color_name(player_color)
         return color_map.get(normalized, '')
 
-    def print(self):
+    def _get_player_color_rgb(self, player_color: str):
+        color_map = {
+            'black': (0, 0, 0),
+            'red': (205, 49, 49),
+            'green': (13, 188, 121),
+            'yellow': (229, 229, 16),
+            'blue': (36, 114, 200),
+            'magenta': (188, 63, 188),
+            'cyan': (17, 168, 205),
+            'white': (229, 229, 229),
+            'lightblack': (102, 102, 102),
+            'lightred': (241, 76, 76),
+            'lightgreen': (35, 209, 139),
+            'lightyellow': (245, 245, 67),
+            'lightblue': (59, 142, 234),
+            'lightmagenta': (214, 112, 214),
+            'lightcyan': (41, 184, 219),
+            'lightwhite': (255, 255, 255),
+        }
+        normalized = self._normalize_player_color_name(player_color)
+        return color_map.get(normalized)
+
+    def _get_influence_gradient_color_code(self, player_color: str, influence_score: float):
+        player_rgb = self._get_player_color_rgb(player_color)
+        if player_rgb is None:
+            return ''
+
+        normalized_score = self._clamp_influence_score(influence_score)
+        if normalized_score <= self.INFLUENCE_EPSILON:
+            return ''
+
+        blend_ratio = self.MIN_VISIBLE_INFLUENCE_COLOR_BLEND
+        if normalized_score > self.MIN_VISIBLE_INFLUENCE_SCORE:
+            scaled_score = (
+                (normalized_score - self.MIN_VISIBLE_INFLUENCE_SCORE) /
+                (self.MAX_INFLUENCE_SCORE - self.MIN_VISIBLE_INFLUENCE_SCORE)
+            )
+            blend_ratio += (1.0 - self.MIN_VISIBLE_INFLUENCE_COLOR_BLEND) * scaled_score
+        blended_rgb = tuple(
+            round(255 + ((channel - 255) * blend_ratio))
+            for channel in player_rgb
+        )
+        return f'\033[38;2;{blended_rgb[0]};{blended_rgb[1]};{blended_rgb[2]}m'
+
+    def _get_tile_symbol_for_view(self, tile: Tile, visible_tiles: set[tuple[int, int]] = None,
+                                  discovered_tiles: set[tuple[int, int]] = None):
+        if visible_tiles is not None and discovered_tiles is not None:
+            position = (tile.x, tile.y)
+            if position not in discovered_tiles:
+                return ' ', None, None
+            if position not in visible_tiles:
+                return tile.symbol, None, None
+
+        city = self.get_city(tile.city_id) if tile.city_id is not None else None
+        regiment = self.get_regiment(tile.regiment_id) if tile.regiment_id is not None else None
+        if regiment is not None:
+            return regiment.symbol(), city, regiment
+        if city is not None:
+            return city.symbol, city, regiment
+        return tile.symbol, city, regiment
+
+    def print(self, viewer_player_id: int = None):
+        visible_tiles = None
+        discovered_tiles = None
+        if viewer_player_id is not None:
+            visible_tiles = self.get_player_visible_tiles(viewer_player_id)
+            discovered_tiles = self.update_player_discovery(viewer_player_id)
+
         # Get the max character length for each column of the map for proper alignment
         col_widths = []
         for x in range(self.width):
             col_width = len(str(x))
             for y in range(self.height):
                 tile = self.tiles[(x, y)]
-                city = self.get_city(tile.city_id) if tile.city_id is not None else None
-                regiment = self.get_regiment(tile.regiment_id) if tile.regiment_id is not None else None
-                if regiment is not None:
-                    symbol = regiment.symbol()
-                elif city is not None:
-                    symbol = city.symbol
-                else:
-                    symbol = tile.symbol
+                symbol, _, _ = self._get_tile_symbol_for_view(tile, visible_tiles, discovered_tiles)
                 col_width = max(col_width, len(symbol))
             col_widths.append(col_width)
 
@@ -758,25 +1171,19 @@ class Map:
             row_display = [str(y).rjust(row_label_width)]
             for x in range(self.width):
                 tile = self.tiles[(x, y)]
-                city = self.get_city(tile.city_id) if tile.city_id is not None else None
-                regiment = self.get_regiment(tile.regiment_id) if tile.regiment_id is not None else None
-                if regiment is not None:
-                    symbol = regiment.symbol()
-                elif city is not None:
-                    symbol = city.symbol
-                else:
-                    symbol = tile.symbol
+                symbol, city, regiment = self._get_tile_symbol_for_view(tile, visible_tiles, discovered_tiles)
                 display_symbol = symbol.center(col_widths[x])
-                if regiment is not None:
-                    owner = self.get_player(regiment.owner_id)
-                    color_code = self._get_player_color_code(owner.color) if owner is not None else ''
-                    if color_code:
-                        display_symbol = f'{color_code}{display_symbol}{Style.RESET_ALL}'
-                elif city is not None:
-                    owner = self.get_player(city.owner_id)
-                    color_code = self._get_player_color_code(owner.color) if owner is not None else ''
-                    if color_code:
-                        display_symbol = f'{color_code}{display_symbol}{Style.RESET_ALL}'
+                if viewer_player_id is not None and (x, y) not in visible_tiles:
+                    row_display.append(display_symbol)
+                    continue
+                tile_owner = self.get_player(tile.influence_owner_id) if tile.influence_owner_id is not None else None
+                influence_score = tile.influence_scores.get(tile_owner.id, 0.0) if tile_owner is not None else 0.0
+                color_code = (
+                    self._get_influence_gradient_color_code(tile_owner.color, influence_score)
+                    if tile_owner is not None else ''
+                )
+                if color_code:
+                    display_symbol = f'{color_code}{display_symbol}{Style.RESET_ALL}'
                 row_display.append(display_symbol)
             print(' '.join(row_display))
 
@@ -786,41 +1193,73 @@ class Map:
         for s in City._city_symbols:
             legend_entries.append(f'{s}={City._city_symbols[s]}')
         legend_entries.append('Regiment=R<id>(owner_id)')
+        legend_entries.append('Undiscovered=<space>')
+        legend_entries.append('Influence tint: 0.0=white, 0.01+=40% player color, 1.0=full player color')
         print('-----\nLEGEND:')
         for l in legend_entries:
             print(l, end='; ') if l != legend_entries[-1] else print(l)
         print('\n')
 
-    def print_player_metadata(self):
+    def print_player_metadata(self, sort_by: str = 'influence', show_rank: bool = True):
         if not self.players:
             print('No player metadata is loaded.')
             return
 
+        if sort_by == 'influence':
+            player_entries = self.get_player_influence_rankings()
+        elif sort_by in {'player_id', 'id'}:
+            player_entries = [
+                (player, self.get_player_total_influence_score(player.id))
+                for player in sorted(self.players.values(), key=lambda player: player.id)
+            ]
+        else:
+            raise ValueError(f'Unsupported player metadata sort order: {sort_by}')
+
         print('PLAYERS:')
-        for player in self.players.values():
+        for rank, (player, total_influence_score) in enumerate(player_entries, start=1):
             color_code = self._get_player_color_code(player.color)
-            player_text = f'P{player.id}: {player.name} ({player.color})'
+            prefix = f'{rank}. ' if show_rank else ''
+            player_text = (
+                f'{prefix}P{player.id}: {player.name} ({player.color}) | '
+                f'total influence={total_influence_score:.2f}'
+            )
             if color_code:
                 player_text = f'{color_code}{player_text}{Style.RESET_ALL}'
             print(f'  {player_text}')
         print('')
 
-    def print_city_metadata(self):
+    def print_city_metadata(self, viewer_player_id: int = None):
         if not self.cities:
             print('No city metadata is loaded.')
             return
 
+        visible_tiles = None
+        if viewer_player_id is not None:
+            visible_tiles = self.get_player_visible_tiles(viewer_player_id)
+            self.update_player_discovery(viewer_player_id)
+
+        visible_city_count = 0
         print('CITIES:')
         for city in self.cities.values():
+            location = self.get_city_location(city.id)
+            if viewer_player_id is not None:
+                if location is None or location not in visible_tiles:
+                    continue
+            visible_city_count += 1
             city_type = 'Capital' if city.is_capital else 'City'
             owner = self.get_player(city.owner_id)
             owner_name = owner.name if owner is not None else f'Unknown({city.owner_id})'
             owner_color = self._get_player_color_code(owner.color) if owner is not None else ''
             if owner_color:
                 owner_name = f'{owner_color}{owner_name}{Style.RESET_ALL}'
-            location = self.get_city_location(city.id)
             location_text = f'({location[0]}, {location[1]})' if location is not None else 'UNPLACED'
-            print(f'  {city_type} {city.id}: {city.name} | owner={owner_name} | population={city.population} | defense={city.defense_score} | location={location_text}')
+            print(
+                f'  {city_type} {city.id}: {city.name} | owner={owner_name} | '
+                f'population={city.population} | defense={city.defense_score} | '
+                f'line_of_sight={city.effective_line_of_sight_radius()} | location={location_text}'
+            )
+        if visible_city_count == 0:
+            print('  No cities or capitals are currently within line of sight.')
         print('')
 
 class MapLoader:
@@ -921,6 +1360,7 @@ class MapLoader:
                     city_id=tile_city_attachments.get((x, y)),
                 )
 
+        game_map.refresh_all_player_discovery()
         return game_map
 
 class Menu:
@@ -1030,7 +1470,7 @@ class Game:
             return False
 
         print('Choose an empire for this match:')
-        self.map.print_player_metadata()
+        self.map.print_player_metadata(sort_by='player_id', show_rank=False)
 
         while True:
             selection = input('Enter the empire/player id to control, or leave empty to cancel: ').strip()
@@ -1255,6 +1695,12 @@ class Game:
             if not normalized:
                 raise ValueError('Target selection cannot be empty.')
 
+            def _require_target_visibility(kind: str, entity_id: int, location: tuple[int, int] = None):
+                if location is None:
+                    raise ValueError(f'{kind} {entity_id} is not on the map.')
+                if location not in self.map.get_player_visible_tiles(attacker_owner_id):
+                    raise ValueError(f'{kind} {entity_id} is not currently visible to your empire.')
+
             compact = normalized.replace(' ', '')
             target_token = compact.upper()
             if target_token.startswith('*C') and compact[2:].isdigit():
@@ -1266,6 +1712,7 @@ class Game:
                     raise ValueError(f'City {city_id} is not a capital.')
                 if city.owner_id == attacker_owner_id:
                     raise ValueError('Friendly fire is not allowed.')
+                _require_target_visibility('City', city_id, self.map.get_city_location(city_id))
                 return {'kind': 'city', 'entity': city}
 
             if target_token.startswith('C') and compact[1:].isdigit():
@@ -1277,6 +1724,7 @@ class Game:
                     raise ValueError(f'City {city_id} is a capital. Target it as *C{city_id}.')
                 if city.owner_id == attacker_owner_id:
                     raise ValueError('Friendly fire is not allowed.')
+                _require_target_visibility('City', city_id, self.map.get_city_location(city_id))
                 return {'kind': 'city', 'entity': city}
 
             if target_token.startswith('R') and compact[1:].isdigit():
@@ -1286,22 +1734,25 @@ class Game:
                     raise ValueError(f'Regiment {regiment_id} does not exist.')
                 if regiment.owner_id == attacker_owner_id:
                     raise ValueError('Friendly fire is not allowed.')
+                _require_target_visibility('Regiment', regiment_id, self.map.get_regiment_location(regiment_id))
                 return {'kind': 'regiment', 'entity': regiment}
 
             regiment_matches = [
                 regiment for regiment in _find_regiments_by_name(normalized)
                 if regiment.owner_id != attacker_owner_id
+                and self.map.is_regiment_visible_to_player(regiment.id, attacker_owner_id)
             ]
             city_matches = [
                 city for city in _find_cities_by_name(normalized)
                 if city.owner_id != attacker_owner_id
+                and self.map.is_city_visible_to_player(city.id, attacker_owner_id)
             ]
             target_matches = (
                 [{'kind': 'regiment', 'entity': regiment} for regiment in regiment_matches] +
                 [{'kind': 'city', 'entity': city} for city in city_matches]
             )
             if not target_matches:
-                raise ValueError(f'No enemy regiment or city named "{normalized}" exists.')
+                raise ValueError(f'No visible enemy regiment or city named "{normalized}" exists.')
             if len(target_matches) > 1:
                 raise ValueError(f'Multiple enemy targets named "{normalized}" exist. Use R#, C#, or *C# instead.')
             return target_matches[0]
@@ -1473,7 +1924,18 @@ class Game:
             except ValueError as error:
                 print(error)
 
+        def print_visible_map():
+            selected_player = self.get_selected_player()
+            viewer_player_id = selected_player.id if selected_player is not None else None
+            self.map.print(viewer_player_id=viewer_player_id)
+
+        def print_visible_city_metadata():
+            selected_player = self.get_selected_player()
+            viewer_player_id = selected_player.id if selected_player is not None else None
+            self.map.print_city_metadata(viewer_player_id=viewer_player_id)
+
         def print_regiment_metadata_by_id():
+            selected_player = self.get_selected_player()
             regiment_id_raw = input('Enter regiment id to inspect: ').strip()
             if not regiment_id_raw.isdigit():
                 print('Regiment id must be a positive integer.')
@@ -1484,6 +1946,13 @@ class Game:
             if regiment is None:
                 print(f'Regiment {regiment_id} does not exist.')
                 return
+            if (
+                selected_player is not None and
+                regiment.owner_id != selected_player.id and
+                not self.map.is_regiment_visible_to_player(regiment.id, selected_player.id)
+            ):
+                print(f'Regiment {regiment_id} is not currently visible to your empire.')
+                return
             self.map.print_regiment_metadata(regiment)
 
         def advance_turn():
@@ -1491,14 +1960,15 @@ class Game:
             self.map.reset_regiment_movement_for_new_turn()
             self.map.reset_battle_resolution_for_new_turn()
             process_regiment_build_queue()
-            self.map.print()
+            print_visible_map()
+            self.map.print_player_metadata()
             print_regiment_build_queue_status(show_empty_message=False)
 
         def player_loop():
             player_menu = ConsoleMenu()
-            player_menu.add_option('Print Map', self.map.print, 'm')
+            player_menu.add_option('Print Map', print_visible_map, 'm')
             player_menu.add_option('Print Players', self.map.print_player_metadata, 'p')
-            player_menu.add_option('Print Cities/Capitals', self.map.print_city_metadata, 'c')
+            player_menu.add_option('Print Cities/Capitals', print_visible_city_metadata, 'c')
             player_menu.add_option('Create Regiment', create_regiment_order, 'r')
             player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')

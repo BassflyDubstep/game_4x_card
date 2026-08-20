@@ -10,47 +10,89 @@ colorama_init(autoreset=True)
 
 class Player:
 
-    def __init__(self, id: int, name: str, color: str):
+    MAX_HAND_SIZE = 5
+
+    def __init__(self, id: int, name: str, color: str, controller_type: str = 'human'):
         self.id = id
         self.name = name
         self.color = color
+        self.controller_type = controller_type
+        self.deck = None
+        self.hand = []
+        self.active_card_effects = []
+        self.card_play_lock_sources = 0
+
+    def initialize_cards(self, deck):
+        self.deck = deck
+        self.hand = []
+        self.active_card_effects = []
+        self.card_play_lock_sources = 0
+
+    def can_draw_card(self):
+        return len(self.hand) < self.MAX_HAND_SIZE
+
+    def can_play_cards(self):
+        return self.card_play_lock_sources <= 0
+
+    def hand_limit(self):
+        return self.MAX_HAND_SIZE
 
 class City:
 
     _city_symbols = {'City': 'C', 'Capital': '*C'}
     DEFAULT_LINE_OF_SIGHT_RADIUS = 3
     CAPITAL_LINE_OF_SIGHT_BONUS = 1
+    DEFAULT_ATTACK_RADIUS = 1
+    CAPITAL_ATTACK_RADIUS_BONUS = 1
     DEFAULT_INFLUENCE_ANCHORS = {0: 1.0, 1: 0.8, 2: 0.4, 3: 0.1}
     CAPITAL_INFLUENCE_ANCHORS = {0: 1.0, 1: 0.9, 2: 0.5, 3: 0.2, 4: 0.1}
-    RESISTANCE_MULTIPLIER = 5.0
+    CITY_OCCUPATION_STABILIZATION_TURNS = 5
+    CAPITAL_OCCUPATION_STABILIZATION_TURNS = 10
+    OCCUPATION_INFLUENCE_FLOOR = 0.20
+    CAPITAL_OCCUPATION_INFLUENCE_FLOOR = 0.10
+    DEFAULT_ATTACK_SCALE = 0.75
+    CAPITAL_ATTACK_SCALE = 0.85
+    MIN_POST_CAPTURE_RECOVERY_TURNS = 3
+    RESISTANCE_MULTIPLIER = 6.0
     DEFENSE_SCALE = 1.0
     BASE_SIEGE_RATE = 0.20
     SIEGE_REGEN_RATE = 0.15
     SACK_POPULATION_PENALTY = 0.30
+    POST_CAPTURE_RESISTANCE_RATIO = 0.25
     
     def __init__(self, id: int, name: str, owner_id: int,
                  population: int = 1000, is_capital: bool = False,
-                 defense_score: float = None, line_of_sight_radius: int = None):
+                 defense_score: float = None, attack_score: float = None,
+                 line_of_sight_radius: int = None):
         self.id = id
         self.name = name
         self.owner_id = owner_id
         self.population = population
         self.is_capital = is_capital
         self.defense_score = defense_score if defense_score is not None else self._default_defense_score()
+        self.attack_score = attack_score if attack_score is not None else self._default_attack_score()
         self.line_of_sight_radius = self._validate_line_of_sight_radius(
             self.DEFAULT_LINE_OF_SIGHT_RADIUS if line_of_sight_radius is None else line_of_sight_radius
         )
         self.influence_radius_bonus = 0
         self.influence_score_bonus = 0.0
         self.influence_score_multiplier = 1.0
+        self.defense_score_bonus = 0.0
+        self.attack_score_bonus = 0.0
         self.influence_profile_anchors = self._default_influence_anchors()
         self.max_siege_resistance = self._default_max_siege_resistance()
         self.siege_resistance = self.max_siege_resistance
+        self.occupation_recovery_turns_remaining = 0
+        self.occupation_recovery_total_turns = 0
+        self.siege_repair_delay_turns_remaining = 0
+        self.regiment_production_lock_turns_remaining = 0
+        self.previous_owner_id = None
         self._update_symbol()
 
     def mark_as_capital(self):
         self.is_capital = True
         self.defense_score = self._default_defense_score()
+        self.attack_score = self._default_attack_score()
         self.influence_profile_anchors = self._default_influence_anchors()
         self.max_siege_resistance = self._default_max_siege_resistance()
         self.siege_resistance = self.max_siege_resistance
@@ -58,7 +100,11 @@ class City:
 
     def _default_defense_score(self):
         # Population and capital status provide a simple defensive baseline.
-        return round(20 + (self.population / 200) + (10 if self.is_capital else 0), 2)
+        return round(28 + (self.population / 160) + (14 if self.is_capital else 0), 2)
+
+    def _default_attack_score(self):
+        scale = self.CAPITAL_ATTACK_SCALE if self.is_capital else self.DEFAULT_ATTACK_SCALE
+        return round(self._default_defense_score() * scale, 2)
 
     def _default_max_siege_resistance(self):
         return round(self.defense_score * self.RESISTANCE_MULTIPLIER, 2)
@@ -74,11 +120,45 @@ class City:
         )
 
     def effective_line_of_sight_radius(self):
-        return max(
+        full_radius = max(
             0,
             self.line_of_sight_radius +
             self.influence_radius_bonus +
             (self.CAPITAL_LINE_OF_SIGHT_BONUS if self.is_capital else 0),
+        )
+        occupation_multiplier = self.occupation_influence_multiplier()
+        if occupation_multiplier >= 1.0:
+            return full_radius
+        if full_radius == 0:
+            return 0
+        return max(1, math.ceil(full_radius * occupation_multiplier))
+
+    def effective_attack_radius(self):
+        return max(1, self.DEFAULT_ATTACK_RADIUS + (self.CAPITAL_ATTACK_RADIUS_BONUS if self.is_capital else 0))
+
+    def occupation_stabilization_turns(self):
+        return (
+            self.CAPITAL_OCCUPATION_STABILIZATION_TURNS
+            if self.is_capital else self.CITY_OCCUPATION_STABILIZATION_TURNS
+        )
+
+    def occupation_influence_floor(self):
+        return (
+            self.CAPITAL_OCCUPATION_INFLUENCE_FLOOR
+            if self.is_capital else self.OCCUPATION_INFLUENCE_FLOOR
+        )
+
+    def occupation_influence_multiplier(self):
+        if self.occupation_recovery_turns_remaining <= 0 or self.occupation_recovery_total_turns <= 0:
+            return 1.0
+        progress = (
+            (self.occupation_recovery_total_turns - self.occupation_recovery_turns_remaining) /
+            self.occupation_recovery_total_turns
+        )
+        return round(
+            self.occupation_influence_floor() +
+            ((1.0 - self.occupation_influence_floor()) * max(0.0, min(1.0, progress))),
+            4,
         )
 
     def get_influence_profile(self):
@@ -93,8 +173,74 @@ class City:
 
         influence_profile = self.get_influence_profile()
         base_score = influence_profile.get(distance, 0.0)
-        modified_score = (base_score + self.influence_score_bonus) * self.influence_score_multiplier
+        modified_score = (
+            (base_score + self.influence_score_bonus) *
+            self.influence_score_multiplier *
+            self.occupation_influence_multiplier()
+        )
         return max(0.0, min(1.0, round(modified_score, 4)))
+
+    def effective_defense_score(self):
+        return round(max(0.0, self.defense_score + self.defense_score_bonus), 2)
+
+    def effective_attack_score(self):
+        return round(max(0.0, self.attack_score + self.attack_score_bonus), 2)
+
+    def compute_post_capture_recovery_turns(self, total_influence_score: float, max_influence_score: float):
+        if max_influence_score <= 0:
+            return self.MIN_POST_CAPTURE_RECOVERY_TURNS
+        normalized_influence = max(0.0, min(1.0, total_influence_score / max_influence_score))
+        base_turns = self.occupation_stabilization_turns()
+        return max(
+            self.MIN_POST_CAPTURE_RECOVERY_TURNS,
+            int(math.ceil(base_turns - ((base_turns - self.MIN_POST_CAPTURE_RECOVERY_TURNS) * normalized_influence))),
+        )
+
+    def begin_occupation(self, new_owner_id: int):
+        self.previous_owner_id = self.owner_id
+        self.owner_id = new_owner_id
+        self.population = max(1, round(self.population * (1 - self.SACK_POPULATION_PENALTY)))
+        self.occupation_recovery_total_turns = self.occupation_stabilization_turns()
+        self.occupation_recovery_turns_remaining = self.occupation_recovery_total_turns
+        self.max_siege_resistance = self._default_max_siege_resistance()
+        self.siege_resistance = round(self.max_siege_resistance * self.POST_CAPTURE_RESISTANCE_RATIO, 2)
+        self.siege_repair_delay_turns_remaining = self.occupation_stabilization_turns()
+        self.regiment_production_lock_turns_remaining = self.occupation_stabilization_turns()
+        self._update_symbol()
+
+    def update_post_capture_cooldowns(self, total_influence_score: float, max_influence_score: float):
+        recovery_turns = self.compute_post_capture_recovery_turns(total_influence_score, max_influence_score)
+        self.siege_repair_delay_turns_remaining = recovery_turns
+        self.regiment_production_lock_turns_remaining = recovery_turns
+        return recovery_turns
+
+    def can_queue_regiment(self):
+        return self.regiment_production_lock_turns_remaining <= 0
+
+    def progress_turn_state(self, under_enemy_pressure: bool = False):
+        if not under_enemy_pressure:
+            if self.occupation_recovery_turns_remaining > 0:
+                self.occupation_recovery_turns_remaining -= 1
+            if self.siege_repair_delay_turns_remaining > 0:
+                self.siege_repair_delay_turns_remaining -= 1
+            elif self.siege_resistance < self.max_siege_resistance:
+                self.siege_resistance = round(
+                    min(
+                        self.max_siege_resistance,
+                        self.siege_resistance + (self.SIEGE_REGEN_RATE * self.max_siege_resistance),
+                    ),
+                    2,
+                )
+            if self.regiment_production_lock_turns_remaining > 0:
+                self.regiment_production_lock_turns_remaining -= 1
+        return {
+            'city_id': self.id,
+            'under_enemy_pressure': under_enemy_pressure,
+            'siege_resistance': self.siege_resistance,
+            'occupation_recovery_turns_remaining': self.occupation_recovery_turns_remaining,
+            'siege_repair_delay_turns_remaining': self.siege_repair_delay_turns_remaining,
+            'regiment_production_lock_turns_remaining': self.regiment_production_lock_turns_remaining,
+        }
 
     @staticmethod
     def _build_influence_profile(max_radius: int, anchors: dict[int, float]):
@@ -177,8 +323,348 @@ class Tile:
 
 class Card:
 
+    _next_instance_id = 1
+
+    def __init__(self, definition):
+        self.instance_id = Card._next_instance_id
+        Card._next_instance_id += 1
+        self.definition = definition
+
+    def label(self):
+        return f'[{self.instance_id}] {self.definition.name}'
+
+class CardEffectDefinition:
+
+    def __init__(self, effect_type: str, magnitude = None,
+                 duration_turns: int = 0, metadata: dict | None = None):
+        self.effect_type = str(effect_type).strip()
+        self.magnitude = magnitude
+        self.duration_turns = max(0, int(duration_turns))
+        self.metadata = dict(metadata) if metadata is not None else {}
+
+class CardDefinition:
+
+    def __init__(self, card_id: str, name: str, rarity: str, card_type: str,
+                 target_scope: str, effects: list[CardEffectDefinition],
+                 description: str, deck_weight: int = 1, grant_weight: int = None):
+        self.card_id = str(card_id).strip()
+        self.name = str(name).strip()
+        self.rarity = str(rarity).strip().lower()
+        self.card_type = str(card_type).strip().lower()
+        self.target_scope = str(target_scope).strip().lower()
+        self.effects = list(effects)
+        self.description = str(description).strip()
+        self.deck_weight = max(0, int(deck_weight))
+        self.grant_weight = max(0, int(grant_weight if grant_weight is not None else max(1, deck_weight)))
+
+class Deck:
+
+    def __init__(self, cards: list[Card] = None, reshuffle_enabled: bool = False, rng = None):
+        self.draw_pile = list(cards) if cards is not None else []
+        self.discard_pile = []
+        self.exhausted_pile = []
+        self.reshuffle_enabled = bool(reshuffle_enabled)
+        self.rng = rng if rng is not None else random
+
+    def cards_remaining(self):
+        return len(self.draw_pile)
+
+    def draw(self):
+        if not self.draw_pile and self.reshuffle_enabled and self.discard_pile:
+            self.rng.shuffle(self.discard_pile)
+            self.draw_pile = self.discard_pile
+            self.discard_pile = []
+        if not self.draw_pile:
+            return None
+        return self.draw_pile.pop()
+
+    def discard(self, card: Card):
+        self.discard_pile.append(card)
+
+    def exhaust(self, card: Card):
+        self.exhausted_pile.append(card)
+
+    def add_to_top(self, card: Card):
+        self.draw_pile.append(card)
+
+    def add_to_discard(self, card: Card):
+        self.discard_pile.append(card)
+
+    def peek_top(self, count: int):
+        if count <= 0:
+            return []
+        return list(reversed(self.draw_pile[-count:]))
+
+    def remove_card(self, card: Card):
+        for pile in (self.draw_pile, self.discard_pile, self.exhausted_pile):
+            if card in pile:
+                pile.remove(card)
+                return True
+        return False
+
+class ActiveCardEffect:
+
+    _next_effect_id = 1
+
+    def __init__(self, source_player_id: int, host_player_id: int,
+                 card: Card, target_kind: str, target_id: int | None,
+                 effect: CardEffectDefinition):
+        self.effect_id = ActiveCardEffect._next_effect_id
+        ActiveCardEffect._next_effect_id += 1
+        self.source_player_id = source_player_id
+        self.host_player_id = host_player_id
+        self.card_instance_id = card.instance_id
+        self.card_name = card.definition.name
+        self.target_kind = target_kind
+        self.target_id = target_id
+        self.effect_type = effect.effect_type
+        self.magnitude = effect.magnitude
+        self.turns_remaining = effect.duration_turns
+        self.metadata = dict(effect.metadata)
+
+class CardLibrary:
+
+    RARITY_ORDER = {'common': 0, 'uncommon': 1, 'rare': 2, 'legendary': 3}
+    RARITY_COLORS = {
+        'common': Fore.GREEN,
+        'uncommon': Fore.BLUE,
+        'rare': Fore.MAGENTA,
+        'legendary': Fore.YELLOW,
+    }
+
     def __init__(self):
-        pass
+        self.definitions = {}
+        for definition in self._build_definitions():
+            self.definitions[definition.card_id] = definition
+
+    def _build_definitions(self):
+        definitions = []
+
+        def add(card_id: str, name: str, rarity: str, card_type: str,
+                target_scope: str, description: str, deck_weight: int,
+                effects: list[CardEffectDefinition], grant_weight: int = None):
+            definitions.append(CardDefinition(
+                card_id=card_id,
+                name=name,
+                rarity=rarity,
+                card_type=card_type,
+                target_scope=target_scope,
+                effects=effects,
+                description=description,
+                deck_weight=deck_weight,
+                grant_weight=grant_weight,
+            ))
+
+        add(
+            'battle_drill', 'Battle Drill', 'common', 'duration', 'own_regiment',
+            'Boost one friendly regiment\'s attack and defense for 2 turns.',
+            12,
+            [
+                CardEffectDefinition('regiment_attack_bonus', magnitude=18, duration_turns=2),
+                CardEffectDefinition('regiment_defense_bonus', magnitude=14, duration_turns=2),
+            ],
+        )
+        add(
+            'crippling_mud', 'Crippling Mud', 'common', 'duration', 'enemy_regiment',
+            'Reduce one enemy regiment\'s attack and defense for 2 turns.',
+            11,
+            [
+                CardEffectDefinition('regiment_attack_bonus', magnitude=-18, duration_turns=2),
+                CardEffectDefinition('regiment_defense_bonus', magnitude=-14, duration_turns=2),
+            ],
+        )
+        add(
+            'watchtowers', 'Watchtowers', 'common', 'duration', 'own_city',
+            'Increase one friendly city\'s defense for 2 turns.',
+            11,
+            [CardEffectDefinition('city_defense_bonus', magnitude=20, duration_turns=2)],
+        )
+        add(
+            'sapper_ring', 'Sapper Ring', 'common', 'duration', 'enemy_city',
+            'Reduce one enemy city\'s defense for 2 turns.',
+            10,
+            [CardEffectDefinition('city_defense_bonus', magnitude=-20, duration_turns=2)],
+        )
+        add(
+            'inspiring_banner', 'Inspiring Banner', 'common', 'duration', 'own_regiment',
+            'Increase one friendly regiment\'s influence for 2 turns.',
+            10,
+            [CardEffectDefinition('regiment_influence_multiplier_bonus', magnitude=0.25, duration_turns=2)],
+        )
+        add(
+            'fear_campaign', 'Fear Campaign', 'common', 'duration', 'enemy_regiment',
+            'Reduce one enemy regiment\'s influence for 2 turns.',
+            10,
+            [CardEffectDefinition('regiment_influence_multiplier_bonus', magnitude=-0.25, duration_turns=2)],
+        )
+        add(
+            'harvest_festival', 'Harvest Festival', 'common', 'duration', 'own_city',
+            'Increase one friendly city\'s influence for 2 turns.',
+            10,
+            [CardEffectDefinition('city_influence_multiplier_bonus', magnitude=0.20, duration_turns=2)],
+        )
+        add(
+            'civic_unrest', 'Civic Unrest', 'common', 'duration', 'enemy_city',
+            'Reduce one enemy city\'s influence for 2 turns.',
+            9,
+            [CardEffectDefinition('city_influence_multiplier_bonus', magnitude=-0.20, duration_turns=2)],
+        )
+        add(
+            'forced_march', 'Forced March', 'uncommon', 'duration', 'own_regiment',
+            'A regiment keeps its movement after attack, defend, or split for 2 turns.',
+            7,
+            [CardEffectDefinition('regiment_move_after_action', magnitude=1, duration_turns=2)],
+        )
+        add(
+            'pinning_fire', 'Pinning Fire', 'uncommon', 'duration', 'enemy_regiment',
+            'Prevent one enemy regiment from moving for 2 turns.',
+            7,
+            [CardEffectDefinition('regiment_movement_lock', magnitude=1, duration_turns=2)],
+        )
+        add(
+            'flurry_orders', 'Flurry Orders', 'uncommon', 'duration', 'own_regiment',
+            'Allow one regiment to attack an additional time each turn for 2 turns.',
+            6,
+            [CardEffectDefinition('regiment_extra_attack_bonus', magnitude=1, duration_turns=2)],
+        )
+        add(
+            'rapid_withdrawal', 'Rapid Withdrawal', 'rare', 'immediate', 'own_regiment',
+            'Allow one regiment to keep movement after its next attack, defend, or split.',
+            3,
+            [CardEffectDefinition('grant_move_after_action_charge', magnitude=1)],
+        )
+        add(
+            'mountain_pass', 'Mountain Pass', 'uncommon', 'immediate', 'own_regiment',
+            'Grant one regiment a one-time ability to traverse impassable land terrain.',
+            5,
+            [CardEffectDefinition('grant_terrain_boundary_pass', magnitude=1)],
+        )
+        add(
+            'heroic_volunteer', 'Heroic Volunteer', 'rare', 'immediate', 'own_regiment',
+            'Permanently add a hero to one friendly regiment.',
+            3,
+            [CardEffectDefinition('add_regiment_hero', magnitude=1)],
+        )
+        add(
+            'assassination', 'Assassination', 'rare', 'immediate', 'enemy_regiment',
+            'Kill one hero in an enemy regiment.',
+            3,
+            [CardEffectDefinition('remove_regiment_hero', magnitude=1)],
+        )
+        add(
+            'expansion_charter', 'Expansion Charter', 'rare', 'immediate', 'own_city',
+            'Permanently increase one city\'s influence radius and influence strength.',
+            2,
+            [CardEffectDefinition(
+                'modify_city_radius_and_influence',
+                magnitude=1,
+                metadata={'influence_multiplier_bonus': 0.20},
+            )],
+        )
+        add(
+            'border_crackdown', 'Border Crackdown', 'rare', 'immediate', 'enemy_city',
+            'Permanently reduce one enemy city\'s influence radius and influence strength.',
+            2,
+            [CardEffectDefinition(
+                'modify_city_radius_and_influence',
+                magnitude=-1,
+                metadata={'influence_multiplier_bonus': -0.20},
+            )],
+        )
+        add(
+            'levy_enlistment', 'Levy Enlistment', 'rare', 'immediate', 'own_regiment',
+            'Permanently add units of a chosen type to one friendly regiment.',
+            3,
+            [CardEffectDefinition('modify_regiment_units', magnitude=6, metadata={'unit_choice_required': True})],
+        )
+        add(
+            'supply_attrition', 'Supply Attrition', 'rare', 'immediate', 'enemy_regiment',
+            'Permanently remove units of a chosen type from one enemy regiment.',
+            3,
+            [CardEffectDefinition('modify_regiment_units', magnitude=-4, metadata={'unit_choice_required': True})],
+        )
+        add(
+            'sudden_insight', 'Sudden Insight', 'uncommon', 'immediate', 'self',
+            'Draw 2 extra cards.',
+            6,
+            [CardEffectDefinition('draw_cards', magnitude=2)],
+        )
+        add(
+            'strategic_search', 'Strategic Search', 'uncommon', 'immediate', 'self',
+            'Choose 1 card from the top 8 cards of your deck.',
+            5,
+            [CardEffectDefinition('choose_from_top_cards', magnitude=8)],
+        )
+        add(
+            'treasure_hoard', 'Treasure Hoard', 'rare', 'immediate', 'self',
+            'Gain a random card of a chosen rarity above Common.',
+            3,
+            [CardEffectDefinition('gain_random_card_by_rarity', magnitude=1, metadata={'allowable_rarities': ['uncommon', 'rare', 'legendary']})],
+        )
+        add(
+            'silence_the_court', 'Silence the Court', 'rare', 'duration', 'enemy_player',
+            'Prevent one opponent from playing cards for 2 turns.',
+            3,
+            [CardEffectDefinition('player_card_play_lock', magnitude=1, duration_turns=2)],
+        )
+        add(
+            'war_council', 'War Council', 'uncommon', 'immediate', 'self',
+            'Discard your hand and redraw up to 5 cards.',
+            4,
+            [CardEffectDefinition('discard_hand_and_redraw', magnitude=5)],
+        )
+        add(
+            'imperial_edict', 'Imperial Edict', 'legendary', 'immediate', 'own_regiment',
+            'Permanently add a large number of chosen units to a friendly regiment.',
+            0,
+            [CardEffectDefinition('modify_regiment_units', magnitude=10, metadata={'unit_choice_required': True})],
+            grant_weight=2,
+        )
+        add(
+            'grand_design', 'Grand Design', 'legendary', 'immediate', 'own_city',
+            'Permanently grant a large city influence expansion.',
+            0,
+            [CardEffectDefinition(
+                'modify_city_radius_and_influence',
+                magnitude=2,
+                metadata={'influence_multiplier_bonus': 0.35},
+            )],
+            grant_weight=2,
+        )
+        return definitions
+
+    def get_definition(self, card_id: str):
+        return self.definitions.get(card_id)
+
+    def build_random_deck(self, deck_size: int = 50, rng = None, reshuffle_enabled: bool = False):
+        rng = rng if rng is not None else random
+        eligible_definitions = [definition for definition in self.definitions.values() if definition.deck_weight > 0]
+        if not eligible_definitions:
+            raise ValueError('No card definitions are available to build a deck')
+        chosen_definitions = rng.choices(
+            population=eligible_definitions,
+            weights=[definition.deck_weight for definition in eligible_definitions],
+            k=max(0, int(deck_size)),
+        )
+        cards = [Card(definition) for definition in chosen_definitions]
+        rng.shuffle(cards)
+        return Deck(cards=cards, reshuffle_enabled=reshuffle_enabled, rng=rng)
+
+    def build_random_card_of_rarity(self, rarity: str, rng = None):
+        rarity_name = str(rarity).strip().lower()
+        rng = rng if rng is not None else random
+        eligible_definitions = [
+            definition for definition in self.definitions.values()
+            if definition.rarity == rarity_name and definition.grant_weight > 0
+        ]
+        if not eligible_definitions:
+            raise ValueError(f'No cards are available for rarity "{rarity_name}"')
+        chosen_definition = rng.choices(
+            population=eligible_definitions,
+            weights=[definition.grant_weight for definition in eligible_definitions],
+            k=1,
+        )[0]
+        return Card(chosen_definition)
 
 class Regiment:
 
@@ -186,6 +672,13 @@ class Regiment:
         'infantry': 1.0,
         'ranged': 0.85,
         'cavalry': 1.15,
+        'navy': 1.1,
+    }
+    REGIMENT_DEFENSE_WEIGHTS = {
+        'infantry': 1.15,
+        'ranged': 0.95,
+        'cavalry': 1.0,
+        'navy': 1.05,
     }
     BASE_BATTLE_RATE = 0.25
     FORCE_SIZE_EXPONENT = 0.5
@@ -196,17 +689,21 @@ class Regiment:
     CITY_INFLUENCE_DISRUPTION_PENALTY = 0.25
     HERO_INFLUENCE_BONUS = 0.25
     HERO_INFLUENCE_RADIUS = 1
+    DEFENDING_ATTACK_MULTIPLIER = 0.75
+    DEFENDING_DEFENSE_MULTIPLIER = 1.25
+    DEFENSE_SCORE_SCALE = 100.0
 
     CITY_ATTACK_WEIGHTS = {
         'infantry': 0.8,
         'ranged': 0.7,
         'cavalry': 0.6,
         'siege': 1.6,
+        'navy': 1.1,
     }
 
     def __init__(self, id: int = None, name: str = 'Unnamed Regiment', owner_id: int = None,
                  infantry: int = 0, ranged: int = 0, cavalry: int = 0,
-                 siege: int = 0, heroes: list[str] = None,
+                 siege: int = 0, navy: int = 0, heroes: list[str] = None,
                  line_of_sight_radius: int = None):
         self.id = id
         self.name = name
@@ -215,6 +712,7 @@ class Regiment:
         self.ranged = self._validate_unit_count(ranged, 'ranged')
         self.cavalry = self._validate_unit_count(cavalry, 'cavalry')
         self.siege = self._validate_unit_count(siege, 'siege')
+        self.navy = self._validate_unit_count(navy, 'navy')
         self.heroes = list(heroes) if heroes is not None else []
         self.line_of_sight_radius = self._validate_line_of_sight_radius(
             self.DEFAULT_LINE_OF_SIGHT_RADIUS if line_of_sight_radius is None else line_of_sight_radius
@@ -226,11 +724,22 @@ class Regiment:
         self.hero_influence_bonus = self.HERO_INFLUENCE_BONUS
         self.hero_influence_radius = self.HERO_INFLUENCE_RADIUS
         self.influence_score_multiplier = 1.0
+        self.attack_score_bonus = 0.0
+        self.defense_score_bonus = 0.0
+        self.city_attack_score_bonus = 0.0
+        self.extra_attack_allowance = 0
+        self.attacks_made_this_turn = 0
+        self.move_after_action_sources = 0
+        self.move_after_action_charges = 0
+        self.movement_blocked_sources = 0
+        self.terrain_boundary_pass_enabled = False
 
         self.regiment_attack_score = 0.0
+        self.defense_score = 0.0
         self.city_attack_score = 0.0
         self.movement_spent_this_turn = 0
         self.reorganized_this_turn = False
+        self.is_defending = False
         self.recalculate_attack_scores()
 
     def _validate_unit_count(self, value: int, unit_type: str):
@@ -244,7 +753,7 @@ class Regiment:
         return radius
 
     def total_units(self):
-        return self.infantry + self.ranged + self.cavalry + self.siege
+        return self.infantry + self.ranged + self.cavalry + self.siege + self.navy
 
     def hero_count(self):
         return len(self.heroes)
@@ -256,7 +765,7 @@ class Regiment:
         return self.hero_count() > 0 and self.hero_influence_bonus > 0
 
     def update_composition(self, infantry: int = None, ranged: int = None,
-                           cavalry: int = None, siege: int = None):
+                           cavalry: int = None, siege: int = None, navy: int = None):
         if infantry is not None:
             self.infantry = self._validate_unit_count(infantry, 'infantry')
         if ranged is not None:
@@ -265,6 +774,8 @@ class Regiment:
             self.cavalry = self._validate_unit_count(cavalry, 'cavalry')
         if siege is not None:
             self.siege = self._validate_unit_count(siege, 'siege')
+        if navy is not None:
+            self.navy = self._validate_unit_count(navy, 'navy')
         self.recalculate_attack_scores()
 
     def add_hero(self, hero_name: str):
@@ -273,6 +784,13 @@ class Regiment:
             raise ValueError('Hero name must be a non-empty string')
         self.heroes.append(normalized_name)
         self.recalculate_attack_scores()
+
+    def remove_hero(self):
+        if not self.heroes:
+            raise ValueError(f'Regiment {self.id} has no heroes to remove')
+        removed_hero = self.heroes.pop()
+        self.recalculate_attack_scores()
+        return removed_hero
 
     def symbol(self):
         return f'R{self.id}({self.owner_id})'
@@ -283,6 +801,8 @@ class Regiment:
         return max(1, int(round(movement)))
 
     def movement_remaining(self):
+        if self.movement_blocked_sources > 0:
+            return 0
         return max(0, self.movement_range() - self.movement_spent_this_turn)
 
     def can_move_distance(self, distance: int):
@@ -297,10 +817,64 @@ class Regiment:
     def reset_turn_movement(self):
         self.movement_spent_this_turn = 0
         self.reorganized_this_turn = False
+        self.is_defending = False
+        self.attacks_made_this_turn = 0
 
     def mark_reorganized_this_turn(self):
         self.reorganized_this_turn = True
+        if self.can_move_after_action():
+            self._consume_move_after_action_charge_if_needed()
+            return
         self.consume_movement()
+
+    def max_attacks_per_turn(self):
+        return max(1, 1 + self.extra_attack_allowance)
+
+    def can_attack_this_turn(self):
+        if self.attacks_made_this_turn >= self.max_attacks_per_turn():
+            return False
+        if self.attacks_made_this_turn == 0:
+            return self.movement_remaining() >= 1
+        return True
+
+    def can_move_after_action(self):
+        return self.move_after_action_sources > 0 or self.move_after_action_charges > 0
+
+    def _consume_move_after_action_charge_if_needed(self):
+        if self.move_after_action_charges > 0:
+            self.move_after_action_charges -= 1
+
+    def record_attack_action(self):
+        self.attacks_made_this_turn += 1
+        if self.can_move_after_action():
+            self._consume_move_after_action_charge_if_needed()
+            return
+        self.consume_movement()
+
+    def effective_regiment_attack_score(self):
+        attack_score = max(0.0, self.regiment_attack_score + self.attack_score_bonus)
+        if self.is_defending:
+            return round(attack_score * self.DEFENDING_ATTACK_MULTIPLIER, 2)
+        return round(attack_score, 2)
+
+    def effective_defense_score(self):
+        defense_score = max(0.0, self.defense_score + self.defense_score_bonus)
+        if self.is_defending:
+            return round(defense_score * self.DEFENDING_DEFENSE_MULTIPLIER, 2)
+        return round(defense_score, 2)
+
+    def effective_defense_factor(self):
+        return 1.0 + (self.effective_defense_score() / self.DEFENSE_SCORE_SCALE)
+
+    def enter_defensive_stance(self):
+        self.is_defending = True
+        if self.can_move_after_action():
+            self._consume_move_after_action_charge_if_needed()
+            return
+        self.consume_movement()
+
+    def effective_city_attack_score(self):
+        return round(max(0.0, self.city_attack_score + self.attack_score_bonus + self.city_attack_score_bonus), 2)
 
     def has_ranged_attack_capability(self):
         return self.ranged > 0 or getattr(self, 'navy', 0) > 0
@@ -316,6 +890,10 @@ class Regiment:
             self.REGIMENT_ATTACK_WEIGHTS,
             include_siege=False,
         )
+        self.defense_score = self._compute_weighted_score(
+            self.REGIMENT_DEFENSE_WEIGHTS,
+            include_siege=False,
+        )
         self.city_attack_score = self._compute_weighted_score(
             self.CITY_ATTACK_WEIGHTS,
             include_siege=True,
@@ -326,6 +904,7 @@ class Regiment:
             'infantry': self.infantry,
             'ranged': self.ranged,
             'cavalry': self.cavalry,
+            'navy': self.navy,
         }
         if include_siege:
             unit_counts['siege'] = self.siege
@@ -392,11 +971,29 @@ class Map:
             )
         return round(total_score, 2)
 
+    def get_max_possible_influence_score(self):
+        return max(
+            self.PLAYER_TOTAL_INFLUENCE_TILE_WEIGHT,
+            self.width * self.height * self.PLAYER_TOTAL_INFLUENCE_TILE_WEIGHT,
+        )
+
     def get_player_influence_rankings(self):
         rankings = []
         for player in self.players.values():
             rankings.append((player, self.get_player_total_influence_score(player.id)))
         return sorted(rankings, key=lambda entry: (-entry[1], entry[0].id))
+
+    def get_player_capitals(self, player_id: int):
+        return [
+            city for city in self.cities.values()
+            if city.owner_id == player_id and city.is_capital
+        ]
+
+    def get_players_with_capitals(self):
+        return {
+            player_id for player_id in self.players
+            if self.get_player_capitals(player_id)
+        }
 
     def get_city(self, city_id: int):
         return self.cities.get(city_id)
@@ -427,6 +1024,46 @@ class Map:
         if tile is None or tile.regiment_id is None:
             return None
         return self.get_regiment(tile.regiment_id)
+
+    def get_enemy_regiments_in_range_of_city(self, city_id: int):
+        city = self.get_city(city_id)
+        city_location = self.get_city_location(city_id)
+        if city is None or city_location is None:
+            return []
+        enemy_regiments = []
+        for regiment in self.regiments.values():
+            if regiment.owner_id == city.owner_id:
+                continue
+            regiment_location = self.get_regiment_location(regiment.id)
+            if regiment_location is None:
+                continue
+            attack_distance = self.get_tile_distance(city_location, regiment_location)
+            if attack_distance <= max(regiment.attack_range(), city.effective_attack_radius()):
+                enemy_regiments.append(regiment)
+        return enemy_regiments
+
+    def advance_city_states_for_new_turn(self):
+        city_updates = []
+        owners_to_refresh = set()
+        for city in self.cities.values():
+            was_multiplier = city.occupation_influence_multiplier()
+            was_radius = city.effective_line_of_sight_radius()
+            under_enemy_pressure = bool(self.get_enemy_regiments_in_range_of_city(city.id))
+            update = city.progress_turn_state(under_enemy_pressure=under_enemy_pressure)
+            city_updates.append(update)
+            if (
+                city.owner_id in self.players and (
+                    not math.isclose(was_multiplier, city.occupation_influence_multiplier()) or
+                    was_radius != city.effective_line_of_sight_radius()
+                )
+            ):
+                owners_to_refresh.add(city.owner_id)
+
+        if city_updates:
+            self.recalculate_tile_influence()
+        for player_id in owners_to_refresh:
+            self.update_player_discovery(player_id)
+        return city_updates
 
     def get_tile_distance(self, origin: tuple[int, int], target: tuple[int, int]):
         if origin is None or target is None:
@@ -657,7 +1294,7 @@ class Map:
         target_tile = self.tiles[(target_x, target_y)]
         if target_tile.regiment_id is not None:
             raise ValueError(f'Target tile ({target_x}, {target_y}) already has a regiment')
-        if not target_tile.passable_foot:
+        if not target_tile.passable_foot and not regiment.terrain_boundary_pass_enabled:
             raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments')
 
         delta_x = abs(target_x - start[0])
@@ -671,7 +1308,15 @@ class Map:
 
         self.tiles[start].regiment_id = None
         target_tile.regiment_id = regiment_id
+        if regiment.is_defending:
+            regiment.is_defending = False
         regiment.record_movement(distance)
+        if (
+            regiment.terrain_boundary_pass_enabled and
+            not self.tiles[start].passable_foot and
+            target_tile.passable_foot
+        ):
+            regiment.terrain_boundary_pass_enabled = False
         self.recalculate_tile_influence()
         self.update_player_discovery(regiment.owner_id)
 
@@ -701,7 +1346,7 @@ class Map:
         if not target_tile.passable_foot:
             raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments')
 
-        unit_types = ('infantry', 'ranged', 'cavalry', 'siege')
+        unit_types = ('infantry', 'ranged', 'cavalry', 'siege', 'navy')
         transfer_counts = {}
         for unit_type in unit_types:
             transfer_count = split_counts.get(unit_type, 0)
@@ -733,6 +1378,7 @@ class Map:
             ranged=transfer_counts['ranged'],
             cavalry=transfer_counts['cavalry'],
             siege=transfer_counts['siege'],
+            navy=transfer_counts['navy'],
         )
         self.add_regiment(split_regiment, target_x, target_y)
         regiment.update_composition(
@@ -740,6 +1386,7 @@ class Map:
             ranged=remaining_counts['ranged'],
             cavalry=remaining_counts['cavalry'],
             siege=remaining_counts['siege'],
+            navy=remaining_counts['navy'],
         )
         regiment.mark_reorganized_this_turn()
         split_regiment.mark_reorganized_this_turn()
@@ -785,6 +1432,7 @@ class Map:
             ranged=target_regiment.ranged + source_regiment.ranged,
             cavalry=target_regiment.cavalry + source_regiment.cavalry,
             siege=target_regiment.siege + source_regiment.siege,
+            navy=target_regiment.navy + source_regiment.navy,
         )
         target_regiment.heroes.extend(source_regiment.heroes)
         target_regiment.recalculate_attack_scores()
@@ -817,27 +1465,29 @@ class Map:
                 f'Battle between Regiment {regiment_a_id} and Regiment {regiment_b_id} has already been resolved this turn'
             )
 
-        power_a = regiment_a.regiment_attack_score * (regiment_a.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
-        power_b = regiment_b.regiment_attack_score * (regiment_b.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
-        total_power = power_a + power_b
-        if total_power == 0:
+        power_a = regiment_a.effective_regiment_attack_score() * (regiment_a.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
+        power_b = regiment_b.effective_regiment_attack_score() * (regiment_b.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
+        pressure_a = power_b / regiment_a.effective_defense_factor()
+        pressure_b = power_a / regiment_b.effective_defense_factor()
+        total_pressure = pressure_a + pressure_b
+        if total_pressure == 0:
             loss_fraction_a = 0.0
             loss_fraction_b = 0.0
         else:
-            loss_fraction_a = Regiment.BASE_BATTLE_RATE * (power_b / total_power)
-            loss_fraction_b = Regiment.BASE_BATTLE_RATE * (power_a / total_power)
+            loss_fraction_a = Regiment.BASE_BATTLE_RATE * (pressure_a / total_pressure)
+            loss_fraction_b = Regiment.BASE_BATTLE_RATE * (pressure_b / total_pressure)
 
         casualties_a = self._apply_regiment_battle_losses(
             regiment_a,
             min(
-                regiment_a.infantry + regiment_a.ranged + regiment_a.cavalry,
+                regiment_a.total_units(),
                 int(math.floor((regiment_a.total_units() * loss_fraction_a) + 0.5)),
             ),
         )
         casualties_b = self._apply_regiment_battle_losses(
             regiment_b,
             min(
-                regiment_b.infantry + regiment_b.ranged + regiment_b.cavalry,
+                regiment_b.total_units(),
                 int(math.floor((regiment_b.total_units() * loss_fraction_b) + 0.5)),
             ),
         )
@@ -874,6 +1524,16 @@ class Map:
         defender = self.get_regiment(defender_id)
         if defender is None:
             raise ValueError(f'Regiment {defender_id} does not exist')
+        if attacker.total_units() == 0:
+            raise ValueError(f'Regiment {attacker_id} has no units remaining')
+        if not attacker.can_attack_this_turn():
+            raise ValueError(
+                f'Regiment {attacker_id} cannot attack again this turn '
+                f'(movement remaining={attacker.movement_remaining()}, '
+                f'attacks remaining={max(0, attacker.max_attacks_per_turn() - attacker.attacks_made_this_turn)})'
+            )
+        if attacker.is_defending:
+            raise ValueError(f'Regiment {attacker_id} is defending and cannot attack this turn')
 
         attacker_location = self.get_regiment_location(attacker_id)
         defender_location = self.get_regiment_location(defender_id)
@@ -889,8 +1549,16 @@ class Map:
                 f'but Regiment {defender_id} is {attack_distance} tile(s) away'
             )
 
+        defender_was_defending = defender.is_defending
+        defender_effective_attack_score = defender.effective_regiment_attack_score()
+        defender_defense_score = defender.effective_defense_score()
         result = self.resolve_regiment_battle(attacker_id, defender_id)
+        attacker.record_attack_action()
         result['attack_distance'] = attack_distance
+        result['attacker_spent_all_movement'] = attacker.movement_remaining() == 0
+        result['defender_was_defending'] = defender_was_defending
+        result['defender_effective_attack_score'] = defender_effective_attack_score
+        result['defender_defense_score'] = defender_defense_score
         return result
 
     def resolve_siege(self, regiment_id: int = None, city_id: int = None) -> dict:
@@ -936,29 +1604,46 @@ class Map:
             regiment.owner_id != city.owner_id
         )
 
-        if is_besieging:
-            siege_pressure = regiment.city_attack_score * regiment.total_units()
-            total_pressure = siege_pressure + (city.defense_score * City.DEFENSE_SCALE)
-            loss_fraction = 0.0 if total_pressure == 0 else City.BASE_SIEGE_RATE * (siege_pressure / total_pressure)
-            resistance_loss = city.siege_resistance * loss_fraction
-            city.siege_resistance = round(max(0.0, city.siege_resistance - resistance_loss), 2)
+        if not is_besieging:
+            raise ValueError(f'Regiment {regiment_id} is not in a valid position to besiege City {city_id}')
 
-            if city.siege_resistance <= 0:
-                city.owner_id = regiment.owner_id
-                city.population = round(city.population * (1 - City.SACK_POPULATION_PENALTY))
-                city.siege_resistance = city.max_siege_resistance
-                city._update_symbol()
-                self.recalculate_tile_influence()
-                self.update_player_discovery(city.owner_id)
-                sacked = True
-        else:
-            city.siege_resistance = round(
-                min(
-                    city.max_siege_resistance,
-                    city.siege_resistance + (City.SIEGE_REGEN_RATE * city.max_siege_resistance),
-                ),
-                2,
+        siege_pressure = regiment.effective_city_attack_score() * (regiment.total_units() ** Regiment.FORCE_SIZE_EXPONENT)
+        city_resilience = city.effective_defense_score() * City.DEFENSE_SCALE
+        total_pressure = siege_pressure + city_resilience
+        loss_fraction = 0.0 if total_pressure == 0 else City.BASE_SIEGE_RATE * (siege_pressure / total_pressure)
+        raw_resistance_loss = city.siege_resistance * loss_fraction
+        resistance_loss = 0.0 if city.siege_resistance <= 0 else max(0.01, round(raw_resistance_loss, 2))
+        city.siege_resistance = round(max(0.0, city.siege_resistance - resistance_loss), 2)
+
+        city_counter_pressure = city.effective_attack_score() * (
+            1.0 + (city.siege_resistance / max(city.max_siege_resistance, 1.0))
+        )
+        attacker_resilience = regiment.effective_defense_factor()
+        retaliation_fraction = 0.0 if city_counter_pressure <= 0 else min(
+            Regiment.BASE_BATTLE_RATE,
+            0.10 + (0.12 * (city_counter_pressure / (city_counter_pressure + (regiment.effective_regiment_attack_score() or 1.0) * attacker_resilience)))
+        )
+        attacker_casualty_count = min(
+            regiment.total_units(),
+            int(math.floor((regiment.total_units() * retaliation_fraction) + 0.5)),
+        )
+        attacker_casualties = self._apply_regiment_battle_losses(regiment, attacker_casualty_count)
+        attacker_destroyed = regiment.total_units() == 0
+        if attacker_destroyed:
+            self._remove_regiment_from_map(regiment_id)
+
+        if city.siege_resistance <= 0:
+            previous_owner_id = city.owner_id
+            city.begin_occupation(regiment.owner_id)
+            self.recalculate_tile_influence()
+            city.update_post_capture_cooldowns(
+                total_influence_score=self.get_player_total_influence_score(city.owner_id),
+                max_influence_score=self.get_max_possible_influence_score(),
             )
+            self.update_player_discovery(city.owner_id)
+            if previous_owner_id in self.players:
+                self.update_player_discovery(previous_owner_id)
+            sacked = True
 
         self.resolved_sieges_this_turn.add(city_id)
         result = {
@@ -967,17 +1652,34 @@ class Map:
             'resistance_before': resistance_before,
             'resistance_after': city.siege_resistance,
             'max_resistance': city.max_siege_resistance,
+            'attacker_casualties': attacker_casualties,
+            'attacker_remaining_units': regiment.total_units() if not attacker_destroyed else 0,
+            'attacker_destroyed': attacker_destroyed,
+            'city_attack_score': city.effective_attack_score(),
             'sacked': sacked,
         }
         if sacked:
             result['previous_owner_id'] = previous_owner_id
             result['new_owner_id'] = city.owner_id
+            result['occupation_recovery_turns_remaining'] = city.occupation_recovery_turns_remaining
+            result['siege_repair_delay_turns_remaining'] = city.siege_repair_delay_turns_remaining
+            result['regiment_production_lock_turns_remaining'] = city.regiment_production_lock_turns_remaining
         return result
 
     def attack_city(self, regiment_id: int, city_id: int) -> dict:
         regiment = self.get_regiment(regiment_id)
         if regiment is None:
             raise ValueError(f'Regiment {regiment_id} does not exist')
+        if regiment.total_units() == 0:
+            raise ValueError(f'Regiment {regiment_id} has no units remaining')
+        if not regiment.can_attack_this_turn():
+            raise ValueError(
+                f'Regiment {regiment_id} cannot attack again this turn '
+                f'(movement remaining={regiment.movement_remaining()}, '
+                f'attacks remaining={max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)})'
+            )
+        if regiment.is_defending:
+            raise ValueError(f'Regiment {regiment_id} is defending and cannot attack this turn')
 
         city = self.get_city(city_id)
         if city is None:
@@ -985,11 +1687,36 @@ class Map:
         if regiment.owner_id == city.owner_id:
             raise ValueError(f'Regiment {regiment_id} and City {city_id} belong to the same owner')
 
-        attack_result = self.resolve_siege(regiment_id=regiment_id, city_id=city_id)
         regiment_location = self.get_regiment_location(regiment_id)
         city_location = self.get_city_location(city_id)
+        attack_result = self.resolve_siege(regiment_id=regiment_id, city_id=city_id)
+        if regiment.total_units() > 0:
+            regiment.record_attack_action()
         attack_result['attack_distance'] = self.get_tile_distance(regiment_location, city_location)
+        attack_result['attacker_spent_all_movement'] = True if attack_result['attacker_destroyed'] else regiment.movement_remaining() == 0
         return attack_result
+
+    def defend_regiment(self, regiment_id: int):
+        regiment = self.get_regiment(regiment_id)
+        if regiment is None:
+            raise ValueError(f'Regiment {regiment_id} does not exist')
+        if regiment.total_units() == 0:
+            raise ValueError(f'Regiment {regiment_id} has no units remaining')
+        if self.get_regiment_location(regiment_id) is None:
+            raise ValueError(f'Regiment {regiment_id} is not on the map')
+        if regiment.movement_remaining() < 1:
+            raise ValueError(f'Regiment {regiment_id} has no movement remaining to defend')
+        if regiment.is_defending:
+            raise ValueError(f'Regiment {regiment_id} is already defending this turn')
+
+        regiment.enter_defensive_stance()
+        return {
+            'regiment_id': regiment_id,
+            'defense_score': regiment.defense_score,
+            'effective_defense_score': regiment.effective_defense_score(),
+            'effective_attack_score': regiment.effective_regiment_attack_score(),
+            'movement_remaining': regiment.movement_remaining(),
+        }
 
     def reset_regiment_movement_for_new_turn(self):
         for regiment in self.regiments.values():
@@ -1000,14 +1727,14 @@ class Map:
         self.resolved_sieges_this_turn.clear()
 
     def _apply_regiment_battle_losses(self, regiment: Regiment, casualty_count: int):
-        casualties = {'infantry': 0, 'ranged': 0, 'cavalry': 0}
-        total_combat_units = regiment.infantry + regiment.ranged + regiment.cavalry
+        casualties = {'infantry': 0, 'ranged': 0, 'cavalry': 0, 'siege': 0, 'navy': 0}
+        total_combat_units = regiment.infantry + regiment.ranged + regiment.cavalry + regiment.siege + regiment.navy
         casualty_count = max(0, min(total_combat_units, casualty_count))
         if casualty_count == 0 or total_combat_units == 0:
             return casualties
 
         shares = []
-        for unit_type in ('infantry', 'ranged', 'cavalry'):
+        for unit_type in ('infantry', 'ranged', 'cavalry', 'siege', 'navy'):
             unit_count = getattr(regiment, unit_type)
             share = casualty_count * (unit_count / total_combat_units)
             assigned = math.floor(share)
@@ -1023,7 +1750,8 @@ class Map:
             infantry=max(0, regiment.infantry - casualties['infantry']),
             ranged=max(0, regiment.ranged - casualties['ranged']),
             cavalry=max(0, regiment.cavalry - casualties['cavalry']),
-            siege=regiment.siege,
+            siege=max(0, regiment.siege - casualties['siege']),
+            navy=max(0, regiment.navy - casualties['navy']),
         )
         return casualties
 
@@ -1049,14 +1777,27 @@ class Map:
 
         print('REGIMENT:')
         print(f'  id={regiment.id} | name={regiment.name} | owner={owner_name} | location={location_text}')
-        print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, heroes={regiment.hero_count()}')
+        print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, navy={regiment.navy}, heroes={regiment.hero_count()}')
         print(
-            f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_city={regiment.city_attack_score} '
-            f'| move_range={regiment.movement_range()} | attack_range={regiment.attack_range()} '
-            f'| line_of_sight={regiment.effective_line_of_sight_radius()}'
+            f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_regiment_effective={regiment.effective_regiment_attack_score()}, '
+            f'defense={regiment.defense_score}, defense_effective={regiment.effective_defense_score()}, vs_city={regiment.effective_city_attack_score()} '
+            f'| move_range={regiment.movement_range()} | move_remaining={regiment.movement_remaining()} '
+            f'| attack_range={regiment.attack_range()} | attacks_remaining={max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)} '
+            f'| line_of_sight={regiment.effective_line_of_sight_radius()} | stance={"DEFEND" if regiment.is_defending else "READY"}'
         )
         if regiment.heroes:
             print(f'  heroes: {", ".join(regiment.heroes)}')
+        if regiment.move_after_action_sources > 0 or regiment.move_after_action_charges > 0:
+            print(
+                f'  card effects: move-after-action turns={regiment.move_after_action_sources}, '
+                f'one-shot charges={regiment.move_after_action_charges}'
+            )
+        if regiment.extra_attack_allowance > 0:
+            print(f'  card effects: bonus attacks per turn={regiment.extra_attack_allowance}')
+        if regiment.movement_blocked_sources > 0:
+            print(f'  card effects: movement blocked by {regiment.movement_blocked_sources} effect(s)')
+        if regiment.terrain_boundary_pass_enabled:
+            print('  card effects: impassable terrain traversal is active')
         print('')
 
     def _normalize_player_color_name(self, player_color: str):
@@ -1255,9 +1996,20 @@ class Map:
             location_text = f'({location[0]}, {location[1]})' if location is not None else 'UNPLACED'
             print(
                 f'  {city_type} {city.id}: {city.name} | owner={owner_name} | '
-                f'population={city.population} | defense={city.defense_score} | '
+                f'population={city.population} | attack={city.effective_attack_score()} | '
+                f'defense={city.effective_defense_score()} | siege={city.siege_resistance}/{city.max_siege_resistance} | '
                 f'line_of_sight={city.effective_line_of_sight_radius()} | location={location_text}'
             )
+            if city.occupation_recovery_turns_remaining > 0:
+                print(
+                    f'    occupation recovery: {city.occupation_recovery_turns_remaining} turn(s) remaining | '
+                    f'influence multiplier={city.occupation_influence_multiplier():.2f}'
+                )
+            if city.siege_repair_delay_turns_remaining > 0:
+                print(
+                    f'    siege repairs: delayed for {city.siege_repair_delay_turns_remaining} turn(s) | '
+                    f'regiment production lock={city.regiment_production_lock_turns_remaining}'
+                )
         if visible_city_count == 0:
             print('  No cities or capitals are currently within line of sight.')
         print('')
@@ -1455,6 +2207,12 @@ class Game:
         self.selected_player_id = None
         self.turn = 0
         self.regiment_build_queue = []
+        self.card_library = CardLibrary()
+        self.random = random.Random()
+        self.allow_deck_reshuffle = False
+        self.card_unlock_turn = 3
+        self.active_victory_conditions = ['capture-all-capitals']
+        self.influence_victory_threshold = None
 
     def get_selected_player(self):
         if self.map is None or self.selected_player_id is None:
@@ -1492,6 +2250,481 @@ class Game:
             print(f'You are now playing as {selected_player.name}.')
             return True
 
+    def initialize_player_card_system(self):
+        if self.map is None:
+            raise ValueError('A map must be loaded before initializing player decks')
+        Card._next_instance_id = 1
+        ActiveCardEffect._next_effect_id = 1
+        for player in self.map.players.values():
+            player.initialize_cards(self.card_library.build_random_deck(
+                deck_size=50,
+                rng=self.random,
+                reshuffle_enabled=self.allow_deck_reshuffle,
+            ))
+        for player in self.map.players.values():
+            self.draw_cards_for_player(player.id, 5)
+
+    def get_card_draw_probability(self, player_id: int):
+        if self.map is None:
+            return 0.0
+        total_influence = self.map.get_player_total_influence_score(player_id)
+        max_map_influence = max(
+            100.0,
+            self.map.width * self.map.height * self.map.PLAYER_TOTAL_INFLUENCE_TILE_WEIGHT,
+        )
+        normalized_score = max(0.0, min(1.0, total_influence / max_map_influence))
+        return round(min(0.85, 0.15 + (normalized_score * 0.70)), 4)
+
+    def _refresh_card_affected_map_state(self, refresh_visibility: bool = False):
+        if self.map is None:
+            return
+        if refresh_visibility:
+            self.map.refresh_all_player_discovery()
+        else:
+            self.map.recalculate_tile_influence()
+
+    def draw_card_for_player(self, player_id: int):
+        if self.map is None:
+            raise ValueError('A map must be loaded before drawing cards')
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        if player.deck is None:
+            raise ValueError(f'Player {player_id} does not have a deck')
+        if not player.can_draw_card():
+            return {'drawn': False, 'reason': 'hand_full'}
+        drawn_card = player.deck.draw()
+        if drawn_card is None:
+            return {'drawn': False, 'reason': 'deck_empty'}
+        player.hand.append(drawn_card)
+        return {'drawn': True, 'card': drawn_card}
+
+    def draw_cards_for_player(self, player_id: int, count: int):
+        draw_results = []
+        for _ in range(max(0, int(count))):
+            draw_result = self.draw_card_for_player(player_id)
+            draw_results.append(draw_result)
+            if not draw_result['drawn']:
+                break
+        return draw_results
+
+    def discard_card_for_player(self, player_id: int, hand_index: int):
+        if self.turn <= self.card_unlock_turn:
+            raise ValueError(f'Cards cannot be discarded until after turn {self.card_unlock_turn}')
+        player = self.map.get_player(player_id) if self.map is not None else None
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        if player.deck is None:
+            raise ValueError(f'Player {player_id} does not have a deck')
+        if hand_index < 0 or hand_index >= len(player.hand):
+            raise ValueError(f'Hand selection {hand_index + 1} is out of range')
+        discarded_card = player.hand.pop(hand_index)
+        player.deck.discard(discarded_card)
+        return {'discarded': True, 'card': discarded_card}
+
+    def preview_top_cards_for_player(self, player_id: int, count: int):
+        player = self.map.get_player(player_id) if self.map is not None else None
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        if player.deck is None:
+            raise ValueError(f'Player {player_id} does not have a deck')
+        return player.deck.peek_top(count)
+
+    def print_player_hand(self, player_id: int):
+        player = self.map.get_player(player_id) if self.map is not None else None
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        if player.deck is None:
+            print('This player has no deck.')
+            return
+        print(
+            f'CARDS: hand={len(player.hand)}/{player.hand_limit()} | '
+            f'deck={player.deck.cards_remaining()} | discard={len(player.deck.discard_pile)} | '
+            f'exhausted={len(player.deck.exhausted_pile)}'
+        )
+        if not player.hand:
+            print('  No cards in hand.')
+            print('')
+            return
+        for index, card in enumerate(player.hand, start=1):
+            rarity_color = self.card_library.RARITY_COLORS.get(card.definition.rarity, '')
+            rarity_label = card.definition.rarity.title()
+            card_label = f'{index}. {card.definition.name} [{rarity_label} | {card.definition.card_type}]'
+            if rarity_color:
+                card_label = f'{rarity_color}{card_label}{Style.RESET_ALL}'
+            print(f'  {card_label}')
+            print(f'     {card.definition.description}')
+        print('')
+
+    def _resolve_card_target(self, player: Player, definition: CardDefinition, target_payload: dict):
+        target_scope = definition.target_scope
+        payload = dict(target_payload) if target_payload is not None else {}
+        if target_scope in {'self', 'none'}:
+            return {'target_kind': 'player', 'entity': player, 'target_id': player.id}
+
+        target_kind = payload.get('target_kind')
+        target_id = payload.get('target_id')
+        if target_kind is None or target_id is None:
+            raise ValueError(f'Card "{definition.name}" requires a target')
+
+        if target_scope in {'own_regiment', 'enemy_regiment'}:
+            if target_kind != 'regiment':
+                raise ValueError(f'Card "{definition.name}" must target a regiment')
+            regiment = self.map.get_regiment(int(target_id)) if self.map is not None else None
+            if regiment is None:
+                raise ValueError(f'Regiment {target_id} does not exist')
+            is_owned = regiment.owner_id == player.id
+            if target_scope == 'own_regiment' and not is_owned:
+                raise ValueError(f'Card "{definition.name}" must target one of your regiments')
+            if target_scope == 'enemy_regiment':
+                if is_owned:
+                    raise ValueError(f'Card "{definition.name}" must target an enemy regiment')
+                if not self.map.is_regiment_visible_to_player(regiment.id, player.id):
+                    raise ValueError(f'Enemy regiment {regiment.id} is not visible to your empire')
+            return {'target_kind': 'regiment', 'entity': regiment, 'target_id': regiment.id}
+
+        if target_scope in {'own_city', 'enemy_city'}:
+            if target_kind != 'city':
+                raise ValueError(f'Card "{definition.name}" must target a city')
+            city = self.map.get_city(int(target_id)) if self.map is not None else None
+            if city is None:
+                raise ValueError(f'City {target_id} does not exist')
+            is_owned = city.owner_id == player.id
+            if target_scope == 'own_city' and not is_owned:
+                raise ValueError(f'Card "{definition.name}" must target one of your cities')
+            if target_scope == 'enemy_city':
+                if is_owned:
+                    raise ValueError(f'Card "{definition.name}" must target an enemy city')
+                if not self.map.is_city_visible_to_player(city.id, player.id):
+                    raise ValueError(f'Enemy city {city.id} is not visible to your empire')
+            return {'target_kind': 'city', 'entity': city, 'target_id': city.id}
+
+        if target_scope == 'enemy_player':
+            if target_kind != 'player':
+                raise ValueError(f'Card "{definition.name}" must target a player')
+            target_player = self.map.get_player(int(target_id)) if self.map is not None else None
+            if target_player is None:
+                raise ValueError(f'Player {target_id} does not exist')
+            if target_player.id == player.id:
+                raise ValueError(f'Card "{definition.name}" must target an opponent')
+            return {'target_kind': 'player', 'entity': target_player, 'target_id': target_player.id}
+
+        raise ValueError(f'Unsupported card target scope: {target_scope}')
+
+    def _resolve_effect_host_player(self, source_player: Player, resolved_target: dict):
+        target_kind = resolved_target.get('target_kind')
+        target_entity = resolved_target.get('entity')
+        if target_kind == 'player' and target_entity is not None:
+            return target_entity
+        if target_kind == 'regiment' and target_entity is not None:
+            return self.map.get_player(target_entity.owner_id)
+        if target_kind == 'city' and target_entity is not None:
+            return self.map.get_player(target_entity.owner_id)
+        return source_player
+
+    def _apply_duration_effect_delta(self, active_effect: ActiveCardEffect, reverse: bool = False):
+        delta = active_effect.magnitude
+        if isinstance(delta, (int, float)) and reverse:
+            delta = -delta
+
+        if active_effect.target_kind == 'regiment':
+            regiment = self.map.get_regiment(active_effect.target_id) if self.map is not None else None
+            if regiment is None:
+                return
+            if active_effect.effect_type == 'regiment_attack_bonus':
+                regiment.attack_score_bonus += delta
+                regiment.city_attack_score_bonus += delta
+            elif active_effect.effect_type == 'regiment_defense_bonus':
+                regiment.defense_score_bonus += delta
+            elif active_effect.effect_type == 'regiment_influence_multiplier_bonus':
+                regiment.influence_score_multiplier = max(0.0, round(regiment.influence_score_multiplier + delta, 4))
+                self._refresh_card_affected_map_state()
+            elif active_effect.effect_type == 'regiment_extra_attack_bonus':
+                regiment.extra_attack_allowance = max(0, regiment.extra_attack_allowance + int(delta))
+            elif active_effect.effect_type == 'regiment_move_after_action':
+                regiment.move_after_action_sources = max(0, regiment.move_after_action_sources + int(delta))
+            elif active_effect.effect_type == 'regiment_movement_lock':
+                regiment.movement_blocked_sources = max(0, regiment.movement_blocked_sources + int(delta))
+            else:
+                raise ValueError(f'Unsupported regiment duration effect: {active_effect.effect_type}')
+            return
+
+        if active_effect.target_kind == 'city':
+            city = self.map.get_city(active_effect.target_id) if self.map is not None else None
+            if city is None:
+                return
+            if active_effect.effect_type == 'city_defense_bonus':
+                city.defense_score_bonus += delta
+            elif active_effect.effect_type == 'city_influence_multiplier_bonus':
+                city.influence_score_multiplier = max(0.0, round(city.influence_score_multiplier + delta, 4))
+                self._refresh_card_affected_map_state()
+            else:
+                raise ValueError(f'Unsupported city duration effect: {active_effect.effect_type}')
+            return
+
+        if active_effect.target_kind == 'player':
+            target_player = self.map.get_player(active_effect.target_id) if self.map is not None else None
+            if target_player is None:
+                return
+            if active_effect.effect_type == 'player_card_play_lock':
+                target_player.card_play_lock_sources = max(0, target_player.card_play_lock_sources + int(delta))
+                return
+            raise ValueError(f'Unsupported player duration effect: {active_effect.effect_type}')
+
+        raise ValueError(f'Unsupported duration effect target: {active_effect.target_kind}')
+
+    def _execute_immediate_card_effect(self, source_player: Player, card: Card,
+                                       effect: CardEffectDefinition, resolved_target: dict,
+                                       target_payload: dict):
+        target_entity = resolved_target.get('entity')
+        target_kind = resolved_target.get('target_kind')
+        payload = dict(target_payload) if target_payload is not None else {}
+
+        if effect.effect_type == 'grant_move_after_action_charge':
+            if target_kind != 'regiment':
+                raise ValueError('Move-after-action cards must target a regiment')
+            target_entity.move_after_action_charges += int(effect.magnitude)
+            return [f'{target_entity.symbol()} may keep movement after its next qualifying action.']
+
+        if effect.effect_type == 'grant_terrain_boundary_pass':
+            if target_kind != 'regiment':
+                raise ValueError('Terrain-pass cards must target a regiment')
+            target_entity.terrain_boundary_pass_enabled = True
+            return [f'{target_entity.symbol()} can traverse impassable land terrain until it returns to normal terrain.']
+
+        if effect.effect_type == 'add_regiment_hero':
+            if target_kind != 'regiment':
+                raise ValueError('Hero cards must target a regiment')
+            hero_name = payload.get('hero_name') or f'Hero_{self.random.randint(1000, 9999)}'
+            target_entity.add_hero(hero_name)
+            return [f'{hero_name} joined {target_entity.symbol()}.']
+
+        if effect.effect_type == 'remove_regiment_hero':
+            if target_kind != 'regiment':
+                raise ValueError('Hero-removal cards must target a regiment')
+            removed_hero = target_entity.remove_hero()
+            return [f'{removed_hero} was removed from {target_entity.symbol()}.']
+
+        if effect.effect_type == 'modify_regiment_units':
+            if target_kind != 'regiment':
+                raise ValueError('Unit-modification cards must target a regiment')
+            unit_type = str(payload.get('unit_type', '')).strip().lower()
+            if unit_type not in {'infantry', 'ranged', 'cavalry', 'siege', 'navy'}:
+                raise ValueError('A unit type of infantry, ranged, cavalry, siege, or navy is required')
+            current_value = getattr(target_entity, unit_type)
+            updated_value = max(0, current_value + int(effect.magnitude))
+            if current_value == updated_value and int(effect.magnitude) < 0:
+                raise ValueError(f'{target_entity.symbol()} has no {unit_type} to remove')
+            target_entity.update_composition(**{unit_type: updated_value})
+            self._refresh_card_affected_map_state()
+            return [f'{target_entity.symbol()} {unit_type} changed from {current_value} to {updated_value}.']
+
+        if effect.effect_type == 'draw_cards':
+            draw_results = self.draw_cards_for_player(source_player.id, int(effect.magnitude))
+            drawn_cards = [result['card'].definition.name for result in draw_results if result.get('drawn')]
+            if not drawn_cards:
+                return ['No additional cards could be drawn.']
+            return [f'Drew: {", ".join(drawn_cards)}.']
+
+        if effect.effect_type == 'choose_from_top_cards':
+            top_cards = self.preview_top_cards_for_player(source_player.id, int(effect.magnitude))
+            if not top_cards:
+                return ['No cards remain in the deck to choose from.']
+            if not source_player.can_draw_card():
+                raise ValueError(f'{source_player.name} cannot take a chosen card because the hand is full')
+            choice_index = int(payload.get('choice_index', 0))
+            if choice_index < 0 or choice_index >= len(top_cards):
+                raise ValueError(f'Choice index must be between 1 and {len(top_cards)}')
+            chosen_card = top_cards[choice_index]
+            source_player.deck.remove_card(chosen_card)
+            source_player.hand.append(chosen_card)
+            return [f'Added {chosen_card.definition.name} from the top of the deck to your hand.']
+
+        if effect.effect_type == 'gain_random_card_by_rarity':
+            requested_rarity = str(payload.get('rarity', '')).strip().lower()
+            if requested_rarity not in effect.metadata.get('allowable_rarities', []):
+                raise ValueError('You must choose Uncommon, Rare, or Legendary for this card')
+            if not source_player.can_draw_card():
+                raise ValueError(f'{source_player.name} cannot receive another card because the hand is full')
+            gained_card = self.card_library.build_random_card_of_rarity(requested_rarity, rng=self.random)
+            source_player.hand.append(gained_card)
+            return [f'Gained a random {requested_rarity.title()} card: {gained_card.definition.name}.']
+
+        if effect.effect_type == 'discard_hand_and_redraw':
+            while source_player.hand:
+                source_player.deck.discard(source_player.hand.pop())
+            draw_count = min(int(effect.magnitude), source_player.hand_limit())
+            draw_results = self.draw_cards_for_player(source_player.id, draw_count)
+            drawn_cards = [result['card'].definition.name for result in draw_results if result.get('drawn')]
+            return [f'Redrew {len(drawn_cards)} card(s): {", ".join(drawn_cards) if drawn_cards else "none"}']
+
+        if effect.effect_type == 'modify_city_radius_and_influence':
+            if target_kind != 'city':
+                raise ValueError('City expansion cards must target a city')
+            target_entity.influence_radius_bonus += int(effect.magnitude)
+            target_entity.influence_score_multiplier = max(
+                0.0,
+                round(
+                    target_entity.influence_score_multiplier +
+                    float(effect.metadata.get('influence_multiplier_bonus', 0.0)),
+                    4,
+                ),
+            )
+            self._refresh_card_affected_map_state(refresh_visibility=True)
+            return [
+                f'{target_entity.symbol} now has influence radius bonus {target_entity.influence_radius_bonus} '
+                f'and influence multiplier {target_entity.influence_score_multiplier:.2f}.'
+            ]
+
+        raise ValueError(f'Unsupported immediate card effect: {effect.effect_type}')
+
+    def play_card_for_player(self, player_id: int, hand_index: int, target_payload: dict = None):
+        if self.turn <= self.card_unlock_turn:
+            raise ValueError(f'Cards cannot be played until after turn {self.card_unlock_turn}')
+        if self.map is None:
+            raise ValueError('A map must be loaded before cards can be played')
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        if player.deck is None:
+            raise ValueError(f'Player {player_id} does not have a deck')
+        if not player.can_play_cards():
+            raise ValueError(f'{player.name} is currently prevented from playing cards')
+        if hand_index < 0 or hand_index >= len(player.hand):
+            raise ValueError(f'Hand selection {hand_index + 1} is out of range')
+
+        card = player.hand.pop(hand_index)
+        try:
+            resolved_target = self._resolve_card_target(player, card.definition, target_payload or {})
+            effect_messages = []
+            for effect in card.definition.effects:
+                if effect.duration_turns > 0 or card.definition.card_type == 'duration':
+                    host_player = self._resolve_effect_host_player(player, resolved_target)
+                    active_effect = ActiveCardEffect(
+                        source_player_id=player.id,
+                        host_player_id=host_player.id,
+                        card=card,
+                        target_kind=resolved_target['target_kind'],
+                        target_id=resolved_target['target_id'],
+                        effect=effect,
+                    )
+                    host_player.active_card_effects.append(active_effect)
+                    self._apply_duration_effect_delta(active_effect, reverse=False)
+                    effect_messages.append(
+                        f'{card.definition.name} applied to {resolved_target["target_kind"]} '
+                        f'{resolved_target["target_id"]} for {active_effect.turns_remaining} turn(s).'
+                    )
+                else:
+                    effect_messages.extend(self._execute_immediate_card_effect(
+                        source_player=player,
+                        card=card,
+                        effect=effect,
+                        resolved_target=resolved_target,
+                        target_payload=target_payload or {},
+                    ))
+        except Exception:
+            player.hand.insert(hand_index, card)
+            raise
+
+        player.deck.exhaust(card)
+        return {'played': True, 'card': card, 'messages': effect_messages}
+
+    def process_active_card_effects_for_new_turn(self, viewer_player_id: int = None):
+        if self.map is None:
+            return []
+        expiration_messages = []
+        for player in self.map.players.values():
+            remaining_effects = []
+            for active_effect in player.active_card_effects:
+                active_effect.turns_remaining -= 1
+                if active_effect.turns_remaining > 0:
+                    remaining_effects.append(active_effect)
+                    continue
+                self._apply_duration_effect_delta(active_effect, reverse=True)
+                if viewer_player_id in {None, active_effect.source_player_id, active_effect.host_player_id, active_effect.target_id}:
+                    expiration_messages.append(
+                        f'{active_effect.card_name} expired on {active_effect.target_kind} {active_effect.target_id}.'
+                    )
+            player.active_card_effects = remaining_effects
+        return expiration_messages
+
+    def process_influence_card_draws(self, viewer_player_id: int = None):
+        if self.map is None or self.turn <= self.card_unlock_turn:
+            return []
+        draw_messages = []
+        for player in self.map.players.values():
+            if player.deck is None or not player.can_draw_card():
+                continue
+            if self.random.random() > self.get_card_draw_probability(player.id):
+                continue
+            draw_result = self.draw_card_for_player(player.id)
+            if draw_result.get('drawn') and player.id == viewer_player_id:
+                draw_messages.append(
+                    f'Influence draw: {draw_result["card"].definition.name} '
+                    f'({draw_result["card"].definition.rarity.title()}).'
+                )
+        return draw_messages
+
+    def evaluate_victory_conditions(self):
+        if self.map is None:
+            return None
+        for condition_id in self.active_victory_conditions:
+            if condition_id == 'capture-all-capitals':
+                result = self._check_capture_all_capitals_victory()
+            elif condition_id == 'influence-threshold':
+                result = self._check_influence_score_victory()
+            else:
+                raise ValueError(f'Unsupported victory condition: {condition_id}')
+            if result is not None:
+                return result
+        return None
+
+    def _check_capture_all_capitals_victory(self):
+        players_with_capitals = self.map.get_players_with_capitals()
+        if len(players_with_capitals) != 1:
+            return None
+        winner_id = next(iter(players_with_capitals))
+        capital_count = len(self.map.get_player_capitals(winner_id))
+        if capital_count == 0:
+            return None
+        return {
+            'condition_id': 'capture-all-capitals',
+            'winner_id': winner_id,
+            'details': f'controls the only remaining capital(s): {capital_count}',
+        }
+
+    def _check_influence_score_victory(self):
+        if self.influence_victory_threshold is None:
+            return None
+        for player in self.map.players.values():
+            influence_score = self.map.get_player_total_influence_score(player.id)
+            if influence_score >= self.influence_victory_threshold:
+                return {
+                    'condition_id': 'influence-threshold',
+                    'winner_id': player.id,
+                    'details': (
+                        f'reached influence {influence_score:.2f} '
+                        f'(threshold={self.influence_victory_threshold:.2f})'
+                    ),
+                }
+        return None
+
+    def handle_victory_result(self, victory_result: dict):
+        if victory_result is None:
+            return False
+        winner = self.map.get_player(victory_result['winner_id']) if self.map is not None else None
+        winner_name = winner.name if winner is not None else f'Player {victory_result["winner_id"]}'
+        print(
+            f'VICTORY: {winner_name} wins by {victory_result["condition_id"]}. '
+            f'({victory_result["details"]})'
+        )
+        if self.selected_player_id is not None and self.selected_player_id != victory_result['winner_id']:
+            selected_player = self.map.get_player(self.selected_player_id)
+            if selected_player is not None:
+                print(f'{selected_player.name} has been defeated.')
+        self.player_in_loop = False
+        return True
+
     def run(self):
 
         def start_new_game():
@@ -1516,6 +2749,7 @@ class Game:
                 if not self.select_player_empire():
                     self.map = None
                     return
+                self.initialize_player_card_system()
                 self.player_in_loop = True
                 player_loop()
                 return
@@ -1565,6 +2799,13 @@ class Game:
                 if city is None or city_location is None:
                     print(f"Build order canceled: City {order['city_id']} no longer has a valid location.")
                     completed_orders.append(order)
+                    continue
+                if city.owner_id != order['owner_id']:
+                    print(f"Build order canceled: City {order['city_id']} is no longer controlled by Player {order['owner_id']}.")
+                    completed_orders.append(order)
+                    continue
+                if not city.can_queue_regiment():
+                    order['turns_remaining'] = max(order['turns_remaining'], 1)
                     continue
 
                 try:
@@ -1624,6 +2865,12 @@ class Game:
             if city.owner_id != selected_player.id:
                 print(f'City {city_id} belongs to another empire. You may only create regiments from {selected_player.name} cities.')
                 return
+            if not city.can_queue_regiment():
+                print(
+                    f'{city.name} cannot produce regiments for {city.regiment_production_lock_turns_remaining} more turn(s) '
+                    f'while the occupation is being stabilized.'
+                )
+                return
             if any(
                 order['city_id'] == city.id and order.get('queued_on_turn') == self.turn
                 for order in self.regiment_build_queue
@@ -1668,6 +2915,34 @@ class Game:
                 if _normalize_lookup_name(city.name) == normalized_name
                 and (owner_id is None or city.owner_id == owner_id)
             ]
+
+        def _resolve_owned_city(selection: str, owner_id: int):
+            normalized = str(selection).strip()
+            if not normalized:
+                raise ValueError('City selection cannot be empty.')
+
+            compact = normalized.replace(' ', '')
+            target_token = compact.upper()
+            if target_token.startswith('*C') and compact[2:].isdigit():
+                city_id = int(compact[2:])
+            elif target_token.startswith('C') and compact[1:].isdigit():
+                city_id = int(compact[1:])
+            elif normalized.isdigit():
+                city_id = int(normalized)
+            else:
+                city_matches = _find_cities_by_name(normalized, owner_id=owner_id)
+                if not city_matches:
+                    raise ValueError(f'No city named "{normalized}" belongs to your empire.')
+                if len(city_matches) > 1:
+                    raise ValueError(f'Multiple cities named "{normalized}" belong to your empire. Use the city id instead.')
+                return city_matches[0]
+
+            city = self.map.get_city(city_id)
+            if city is None:
+                raise ValueError(f'City {city_id} does not exist.')
+            if city.owner_id != owner_id:
+                raise ValueError(f'City {city_id} belongs to another empire.')
+            return city
 
         def _resolve_owned_regiment(selection: str, owner_id: int):
             normalized = str(selection).strip()
@@ -1757,55 +3032,97 @@ class Game:
                 raise ValueError(f'Multiple enemy targets named "{normalized}" exist. Use R#, C#, or *C# instead.')
             return target_matches[0]
 
-        def attack_with_regiment():
+        def regiment_attack_or_defend():
             selected_player = self.get_selected_player()
             if selected_player is None:
                 print('No empire is currently selected.')
                 return
 
-            attacker_input = input('Enter attacking regiment id or exact name: ').strip()
+            regiment_input = input('Enter regiment id or exact name to attack/defend with: ').strip()
             try:
-                attacker = _resolve_owned_regiment(attacker_input, selected_player.id)
+                regiment = _resolve_owned_regiment(regiment_input, selected_player.id)
             except ValueError as error:
                 print(error)
                 return
 
-            target_input = input('Enter target (R#, C#, *C#, or exact name): ').strip()
             try:
-                target = _resolve_attack_target(target_input, attacker.owner_id)
+                action = input('Choose action: [a]ttack or [d]efend: ').strip().lower()
+                if action in ('d', 'defend'):
+                    result = self.map.defend_regiment(regiment.id)
+                    print(
+                        f'{regiment.symbol()} is defending this turn. '
+                        f'Attack score while defending: {result["effective_attack_score"]} | '
+                        f'Defense score: {result["defense_score"]} -> {result["effective_defense_score"]}.'
+                    )
+                    print(f'Movement remaining after defending: {result["movement_remaining"]}.')
+                    return
+                if action not in ('a', 'attack'):
+                    print('Action must be "attack" or "defend".')
+                    return
+
+                target_input = input('Enter target (R#, C#, *C#, or exact name): ').strip()
+                target = _resolve_attack_target(target_input, regiment.owner_id)
                 if target['kind'] == 'regiment':
                     defending_regiment = target['entity']
-                    result = self.map.attack_regiment(attacker.id, defending_regiment.id)
+                    result = self.map.attack_regiment(regiment.id, defending_regiment.id)
                     attacker_losses = sum(result['casualties_a'].values())
                     defender_losses = sum(result['casualties_b'].values())
                     print(
-                        f'{attacker.symbol()} attacked {defending_regiment.symbol()} from '
+                        f'{regiment.symbol()} attacked {defending_regiment.symbol()} from '
                         f'{result["attack_distance"]} tile(s).'
                     )
+                    if result['defender_was_defending']:
+                        print(
+                            f'{defending_regiment.symbol()} was defending: '
+                            f'attack reduced to {result["defender_effective_attack_score"]} '
+                            f'while effective defense score {result["defender_defense_score"]} reduced incoming losses.'
+                        )
                     print(
                         f'Attacker losses: {attacker_losses} | Defender losses: {defender_losses} | '
                         f'Remaining units: attacker={result["remaining_units_a"]}, defender={result["remaining_units_b"]}'
                     )
+                    print(
+                        f'Movement remaining: {regiment.movement_remaining()} | '
+                        f'Attacks remaining this turn: {max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)}'
+                    )
                     if result['defeated_a']:
-                        print(f'{attacker.name} was destroyed.')
+                        print(f'{regiment.name} was destroyed.')
                     if result['defeated_b']:
                         print(f'{defending_regiment.name} was destroyed.')
                 else:
                     target_city = target['entity']
                     city_type = 'Capital' if target_city.is_capital else 'City'
-                    result = self.map.attack_city(attacker.id, target_city.id)
+                    result = self.map.attack_city(regiment.id, target_city.id)
                     print(
-                        f'{attacker.symbol()} attacked {city_type} {target_city.id} ({target_city.name}) from '
+                        f'{regiment.symbol()} attacked {city_type} {target_city.id} ({target_city.name}) from '
                         f'{result["attack_distance"]} tile(s).'
                     )
                     print(
                         f'Siege resistance: {result["resistance_before"]} -> '
                         f'{result["resistance_after"]} / {result["max_resistance"]}'
                     )
+                    attacker_losses = sum(result['attacker_casualties'].values())
+                    print(
+                        f'{city_type} retaliation attack={result["city_attack_score"]} | '
+                        f'Attacker losses from city defense: {attacker_losses} | '
+                        f'Attacker remaining units: {result["attacker_remaining_units"]}'
+                    )
+                    print(
+                        f'Movement remaining: {regiment.movement_remaining()} | '
+                        f'Attacks remaining this turn: {max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)}'
+                        if not result['attacker_destroyed']
+                        else f'{regiment.symbol()} was destroyed by city retaliation.'
+                    )
                     if result['sacked']:
                         new_owner = self.map.get_player(result['new_owner_id'])
                         new_owner_name = new_owner.name if new_owner is not None else f'Player {result["new_owner_id"]}'
-                        print(f'{city_type} {target_city.name} was captured by {new_owner_name}.')
+                        print(
+                            f'{city_type} {target_city.name} was captured by {new_owner_name}. '
+                            f'Full city influence returns in {result["occupation_recovery_turns_remaining"]} turn(s). '
+                            f'Siege repairs wait {result["siege_repair_delay_turns_remaining"]} turn(s), and regiment production '
+                            f'is locked for {result["regiment_production_lock_turns_remaining"]} turn(s).'
+                        )
+                        self.handle_victory_result(self.evaluate_victory_conditions())
             except ValueError as error:
                 print(error)
 
@@ -1819,7 +3136,7 @@ class Game:
 
         def _build_split_counts(regiment: Regiment):
             split_counts = {}
-            for unit_type in ('infantry', 'ranged', 'cavalry', 'siege'):
+            for unit_type in ('infantry', 'ranged', 'cavalry', 'siege', 'navy'):
                 percent_raw = input(
                     f'Enter percent of {unit_type} to move into the split regiment '
                     f'(0-100, current={getattr(regiment, unit_type)}): '
@@ -1846,7 +3163,7 @@ class Game:
                 print(
                     'New regiment composition: '
                     f"infantry={split_counts['infantry']}, ranged={split_counts['ranged']}, "
-                    f"cavalry={split_counts['cavalry']}, siege={split_counts['siege']}"
+                    f"cavalry={split_counts['cavalry']}, siege={split_counts['siege']}, navy={split_counts['navy']}"
                 )
                 target_x, target_y = _parse_tile_coordinates(
                     input('Enter adjacent tile for the split regiment as x y: '),
@@ -1865,7 +3182,8 @@ class Game:
                 )
                 print(
                     f"Split {regiment.symbol()} and formed {split_regiment.symbol()} at ({target_x}, {target_y}). "
-                    f'Both regiments have spent their movement for this turn.'
+                    f'Movement remaining: {regiment.symbol()}={regiment.movement_remaining()}, '
+                    f'{split_regiment.symbol()}={split_regiment.movement_remaining()}.'
                 )
             except ValueError as error:
                 print(error)
@@ -1885,7 +3203,8 @@ class Game:
                 print(
                     f'Combined {source_regiment.symbol()} into {combined_regiment.symbol()} at '
                     f'{self.map.get_regiment_location(combined_regiment.id)}. '
-                    f'{combined_regiment.symbol()} kept its id and name and has spent its movement for this turn.'
+                    f'{combined_regiment.symbol()} kept its id and name and has '
+                    f'{combined_regiment.movement_remaining()} movement remaining.'
                 )
             except ValueError as error:
                 print(error)
@@ -1955,25 +3274,217 @@ class Game:
                 return
             self.map.print_regiment_metadata(regiment)
 
+        def print_cards_in_hand():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            self.print_player_hand(selected_player.id)
+
+        def _prompt_for_card_target_payload(selected_player: Player, card: Card):
+            payload = {}
+            target_scope = card.definition.target_scope
+
+            if target_scope == 'own_regiment':
+                regiment = _resolve_owned_regiment(
+                    input('Enter friendly regiment id or exact name to target: ').strip(),
+                    selected_player.id,
+                )
+                payload['target_kind'] = 'regiment'
+                payload['target_id'] = regiment.id
+            elif target_scope == 'enemy_regiment':
+                target = _resolve_attack_target(
+                    input('Enter enemy regiment target (R# or exact name): ').strip(),
+                    selected_player.id,
+                )
+                if target['kind'] != 'regiment':
+                    raise ValueError('This card must target an enemy regiment.')
+                payload['target_kind'] = 'regiment'
+                payload['target_id'] = target['entity'].id
+            elif target_scope == 'own_city':
+                city = _resolve_owned_city(
+                    input('Enter friendly city id or exact name to target: ').strip(),
+                    selected_player.id,
+                )
+                payload['target_kind'] = 'city'
+                payload['target_id'] = city.id
+            elif target_scope == 'enemy_city':
+                target = _resolve_attack_target(
+                    input('Enter enemy city target (C#, *C#, or exact name): ').strip(),
+                    selected_player.id,
+                )
+                if target['kind'] != 'city':
+                    raise ValueError('This card must target an enemy city.')
+                payload['target_kind'] = 'city'
+                payload['target_id'] = target['entity'].id
+            elif target_scope == 'enemy_player':
+                player_id_raw = input('Enter enemy player id to target: ').strip()
+                if not player_id_raw.isdigit():
+                    raise ValueError('Enemy player id must be a positive integer.')
+                target_player_id = int(player_id_raw)
+                target_player = self.map.get_player(target_player_id)
+                if target_player is None:
+                    raise ValueError(f'Player {target_player_id} does not exist.')
+                if target_player.id == selected_player.id:
+                    raise ValueError('You must target an opponent.')
+                payload['target_kind'] = 'player'
+                payload['target_id'] = target_player.id
+
+            effect_types = {effect.effect_type for effect in card.definition.effects}
+            if 'modify_regiment_units' in effect_types:
+                unit_type = input('Choose unit type [infantry/ranged/cavalry/siege/navy]: ').strip().lower()
+                if unit_type not in {'infantry', 'ranged', 'cavalry', 'siege', 'navy'}:
+                    raise ValueError('Unit type must be infantry, ranged, cavalry, siege, or navy.')
+                payload['unit_type'] = unit_type
+
+            if 'gain_random_card_by_rarity' in effect_types:
+                rarity_raw = input('Choose rarity [u]ncommon / [r]are / [l]egendary: ').strip().lower()
+                rarity_lookup = {
+                    'u': 'uncommon', 'uncommon': 'uncommon',
+                    'r': 'rare', 'rare': 'rare',
+                    'l': 'legendary', 'legendary': 'legendary',
+                }
+                if rarity_raw not in rarity_lookup:
+                    raise ValueError('Rarity must be Uncommon, Rare, or Legendary.')
+                payload['rarity'] = rarity_lookup[rarity_raw]
+
+            if 'choose_from_top_cards' in effect_types:
+                preview_count = next(
+                    int(effect.magnitude)
+                    for effect in card.definition.effects
+                    if effect.effect_type == 'choose_from_top_cards'
+                )
+                preview_cards = self.preview_top_cards_for_player(selected_player.id, preview_count)
+                if not preview_cards:
+                    raise ValueError('There are no cards left in the deck to choose from.')
+                print('TOP OF DECK:')
+                for index, preview_card in enumerate(preview_cards, start=1):
+                    print(f'  {index}. {preview_card.definition.name} [{preview_card.definition.rarity.title()}]')
+                choice_raw = input(f'Select one of the top {len(preview_cards)} cards by number: ').strip()
+                if not choice_raw.isdigit():
+                    raise ValueError('Card choice must be a positive integer.')
+                choice_index = int(choice_raw) - 1
+                if choice_index < 0 or choice_index >= len(preview_cards):
+                    raise ValueError(f'Card choice must be between 1 and {len(preview_cards)}.')
+                payload['choice_index'] = choice_index
+
+            if 'add_regiment_hero' in effect_types:
+                hero_name = input('Enter hero name (leave empty for random): ').strip()
+                if hero_name:
+                    payload['hero_name'] = hero_name
+
+            return payload
+
+        def play_card_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            if self.turn <= self.card_unlock_turn:
+                print(f'Cards cannot be played until after turn {self.card_unlock_turn}.')
+                return
+            if not selected_player.can_play_cards():
+                print(f'{selected_player.name} is currently prevented from playing cards.')
+                return
+            if not selected_player.hand:
+                print('There are no cards in your hand.')
+                return
+
+            self.print_player_hand(selected_player.id)
+            hand_selection = input('Enter the hand slot number to play: ').strip()
+            if not hand_selection.isdigit():
+                print('Hand slot must be a positive integer.')
+                return
+
+            hand_index = int(hand_selection) - 1
+            if hand_index < 0 or hand_index >= len(selected_player.hand):
+                print(f'Hand slot must be between 1 and {len(selected_player.hand)}.')
+                return
+
+            card = selected_player.hand[hand_index]
+            try:
+                payload = _prompt_for_card_target_payload(selected_player, card)
+                result = self.play_card_for_player(selected_player.id, hand_index, payload)
+                print(f'Played {result["card"].definition.name}.')
+                for message in result['messages']:
+                    print(f'  {message}')
+            except ValueError as error:
+                print(error)
+
+        def discard_card_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            if self.turn <= self.card_unlock_turn:
+                print(f'Cards cannot be discarded until after turn {self.card_unlock_turn}.')
+                return
+            if not selected_player.hand:
+                print('There are no cards in your hand.')
+                return
+
+            self.print_player_hand(selected_player.id)
+            hand_selection = input('Enter the hand slot number to discard: ').strip()
+            if not hand_selection.isdigit():
+                print('Hand slot must be a positive integer.')
+                return
+
+            hand_index = int(hand_selection) - 1
+            try:
+                discard_result = self.discard_card_for_player(selected_player.id, hand_index)
+                print(f'Discarded {discard_result["card"].definition.name}.')
+            except ValueError as error:
+                print(error)
+
         def advance_turn():
             self.turn += 1
+            expiration_messages = self.process_active_card_effects_for_new_turn(
+                viewer_player_id=self.selected_player_id
+            )
             self.map.reset_regiment_movement_for_new_turn()
             self.map.reset_battle_resolution_for_new_turn()
             process_regiment_build_queue()
+            city_updates = self.map.advance_city_states_for_new_turn()
+            draw_messages = self.process_influence_card_draws(viewer_player_id=self.selected_player_id)
+            victory_result = self.evaluate_victory_conditions()
             print_visible_map()
             self.map.print_player_metadata()
             print_regiment_build_queue_status(show_empty_message=False)
+            for update in city_updates:
+                city = self.map.get_city(update['city_id'])
+                if city is None:
+                    continue
+                if city.owner_id != self.selected_player_id and not self.map.is_city_visible_to_player(city.id, self.selected_player_id):
+                    continue
+                if city.occupation_recovery_turns_remaining > 0:
+                    print(
+                        f'{city.symbol} stabilization: {city.occupation_recovery_turns_remaining} turn(s) remaining | '
+                        f'influence multiplier={city.occupation_influence_multiplier():.2f}'
+                    )
+                if city.siege_repair_delay_turns_remaining > 0:
+                    print(
+                        f'{city.symbol} repairs delayed: {city.siege_repair_delay_turns_remaining} turn(s) remaining | '
+                        f'regiment production lock={city.regiment_production_lock_turns_remaining}'
+                    )
+            for message in expiration_messages:
+                print(message)
+            for message in draw_messages:
+                print(message)
+            self.handle_victory_result(victory_result)
 
         def player_loop():
             player_menu = ConsoleMenu()
             player_menu.add_option('Print Map', print_visible_map, 'm')
             player_menu.add_option('Print Players', self.map.print_player_metadata, 'p')
             player_menu.add_option('Print Cities/Capitals', print_visible_city_metadata, 'c')
+            player_menu.add_option('View Cards', print_cards_in_hand, 'h')
+            player_menu.add_option('Play Card', play_card_action, 'y')
+            player_menu.add_option('Discard Card', discard_card_action, 'd')
             player_menu.add_option('Create Regiment', create_regiment_order, 'r')
             player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
             player_menu.add_option('Combine/Split Regiment', combine_or_split_regiment, 's')
-            player_menu.add_option('Attack With Regiment', attack_with_regiment, 'a')
+            player_menu.add_option('Regiment Attack/Defend', regiment_attack_or_defend, 'a')
             player_menu.add_option('Inspect Regiment By Id', print_regiment_metadata_by_id, 'i')
             player_menu.add_option('Next Turn', advance_turn, 't')
             player_menu.add_option('Quit to Main Menu', quit_to_main_menu, 'q')
@@ -1983,6 +3494,13 @@ class Game:
                 print(f'Turn {self.turn}')
                 if selected_player is not None:
                     print(f'Empire: {selected_player.name} (Player {selected_player.id})')
+                    if selected_player.deck is not None:
+                        print(
+                            f'Cards: hand={len(selected_player.hand)}/{selected_player.hand_limit()} | '
+                            f'deck={selected_player.deck.cards_remaining()} | '
+                            f'discard={len(selected_player.deck.discard_pile)} | '
+                            f'exhausted={len(selected_player.deck.exhausted_pile)}'
+                        )
                 print('---PLAYER OPTIONS---')
                 player_menu.prompt_and_select()
                 print('\n')

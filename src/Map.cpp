@@ -3,5 +3,5 @@
 
 Map::Map() {}
 
-Map::Map(U32 size_x, U32 size_y, TileType default_tile_type)
+Map::Map(U32 size_x, U32 size_y, Tile::TerrainType default_tile_type)
     : size_x_(size_x), size_y_(size_y), default_tile_type_(default_tile_type) {}

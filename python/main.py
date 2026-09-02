@@ -672,13 +672,13 @@ class Regiment:
         'infantry': 1.0,
         'ranged': 0.85,
         'cavalry': 1.15,
-        'navy': 1.1,
+        'navy': 1.45,
     }
     REGIMENT_DEFENSE_WEIGHTS = {
         'infantry': 1.15,
         'ranged': 0.95,
         'cavalry': 1.0,
-        'navy': 1.05,
+        'navy': 1.4,
     }
     BASE_BATTLE_RATE = 0.25
     FORCE_SIZE_EXPONENT = 0.5
@@ -698,8 +698,9 @@ class Regiment:
         'ranged': 0.7,
         'cavalry': 0.6,
         'siege': 1.6,
-        'navy': 1.1,
+        'navy': 1.5,
     }
+    NAVY_MOVEMENT_MULTIPLIER = 0.75
 
     def __init__(self, id: int = None, name: str = 'Unnamed Regiment', owner_id: int = None,
                  infantry: int = 0, ranged: int = 0, cavalry: int = 0,
@@ -740,6 +741,7 @@ class Regiment:
         self.movement_spent_this_turn = 0
         self.reorganized_this_turn = False
         self.is_defending = False
+        self._validate_force_composition()
         self.recalculate_attack_scores()
 
     def _validate_unit_count(self, value: int, unit_type: str):
@@ -755,8 +757,18 @@ class Regiment:
     def total_units(self):
         return self.infantry + self.ranged + self.cavalry + self.siege + self.navy
 
+    def is_navy(self):
+        return self.navy > 0 and (self.infantry + self.ranged + self.cavalry + self.siege) == 0
+
+    def force_kind(self):
+        return 'navy' if self.is_navy() else 'regiment'
+
     def hero_count(self):
         return len(self.heroes)
+
+    def _validate_force_composition(self):
+        if self.navy > 0 and (self.infantry + self.ranged + self.cavalry + self.siege) > 0:
+            raise ValueError('Navy forces may only contain navy units and heroes')
 
     def effective_line_of_sight_radius(self):
         return max(0, self.line_of_sight_radius + self.influence_radius_bonus)
@@ -776,6 +788,7 @@ class Regiment:
             self.siege = self._validate_unit_count(siege, 'siege')
         if navy is not None:
             self.navy = self._validate_unit_count(navy, 'navy')
+        self._validate_force_composition()
         self.recalculate_attack_scores()
 
     def add_hero(self, hero_name: str):
@@ -793,11 +806,13 @@ class Regiment:
         return removed_hero
 
     def symbol(self):
-        return f'R{self.id}({self.owner_id})'
+        return f'N{self.id}({self.owner_id})' if self.is_navy() else f'R{self.id}({self.owner_id})'
 
     def movement_range(self):
         # Larger and stronger regiments move less distance per turn.
         movement = 8 - (self.total_units() / 25) - (self.regiment_attack_score / 120)
+        if self.is_navy():
+            movement *= self.NAVY_MOVEMENT_MULTIPLIER
         return max(1, int(round(movement)))
 
     def movement_remaining(self):
@@ -1273,6 +1288,11 @@ class Map:
         location = self.get_regiment_location(regiment_id)
         return location is not None and self.is_tile_visible_to_player(location[0], location[1], player_id)
 
+    def can_place_regiment_on_tile(self, regiment: Regiment, tile: Tile):
+        if regiment.is_navy():
+            return tile.passable_water
+        return tile.passable_foot or (regiment.terrain_boundary_pass_enabled and not tile.passable_water)
+
     def add_regiment(self, regiment: Regiment, x: int, y: int):
         if regiment.owner_id not in self.players:
             raise ValueError(f'Regiment owner {regiment.owner_id} does not exist')
@@ -1281,7 +1301,9 @@ class Map:
         tile = self.tiles[(x, y)]
         if tile.regiment_id is not None:
             raise ValueError(f'Tile ({x}, {y}) already has a regiment')
-        if not tile.passable_foot:
+        if not self.can_place_regiment_on_tile(regiment, tile):
+            if regiment.is_navy():
+                raise ValueError(f'Tile ({x}, {y}) is not passable for navy forces')
             raise ValueError(f'Tile ({x}, {y}) is not passable for land regiments')
 
         if regiment.id is None:
@@ -1311,7 +1333,9 @@ class Map:
         target_tile = self.tiles[(target_x, target_y)]
         if target_tile.regiment_id is not None:
             raise ValueError(f'Target tile ({target_x}, {target_y}) already has a regiment')
-        if not target_tile.passable_foot and not regiment.terrain_boundary_pass_enabled:
+        if not self.can_place_regiment_on_tile(regiment, target_tile):
+            if regiment.is_navy():
+                raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for navy forces')
             raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments')
 
         delta_x = abs(target_x - start[0])
@@ -1330,6 +1354,7 @@ class Map:
         regiment.record_movement(distance)
         if (
             regiment.terrain_boundary_pass_enabled and
+            not regiment.is_navy() and
             not self.tiles[start].passable_foot and
             target_tile.passable_foot
         ):
@@ -1360,7 +1385,9 @@ class Map:
         target_tile = self.tiles[(target_x, target_y)]
         if target_tile.regiment_id is not None:
             raise ValueError(f'Target tile ({target_x}, {target_y}) already has a regiment')
-        if not target_tile.passable_foot:
+        if not self.can_place_regiment_on_tile(regiment, target_tile):
+            if regiment.is_navy():
+                raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for navy forces')
             raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments')
 
         unit_types = ('infantry', 'ranged', 'cavalry', 'siege', 'navy')
@@ -1422,6 +1449,8 @@ class Map:
             raise ValueError(f'Regiment {target_regiment_id} does not exist')
         if source_regiment.owner_id != target_regiment.owner_id:
             raise ValueError('Only regiments from the same empire may combine')
+        if source_regiment.is_navy() != target_regiment.is_navy():
+            raise ValueError('Land regiments and navies cannot combine')
         if source_regiment.total_units() == 0:
             raise ValueError(f'Regiment {source_regiment_id} has no units remaining')
         if target_regiment.total_units() == 0:
@@ -1839,7 +1868,10 @@ class Map:
         location_text = f'({location[0]}, {location[1]})' if location is not None else 'UNPLACED'
 
         print('REGIMENT:')
-        print(f'  id={regiment.id} | name={regiment.name} | owner={owner_name} | location={location_text}')
+        print(
+            f'  id={regiment.id} | type={"Navy" if regiment.is_navy() else "Regiment"} | '
+            f'name={regiment.name} | owner={owner_name} | location={location_text}'
+        )
         print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, navy={regiment.navy}, heroes={regiment.hero_count()}')
         print(
             f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_regiment_effective={regiment.effective_regiment_attack_score()}, '
@@ -1997,6 +2029,7 @@ class Map:
         for s in City._city_symbols:
             legend_entries.append(f'{s}={City._city_symbols[s]}')
         legend_entries.append('Regiment=R<id>(owner_id)')
+        legend_entries.append('Navy=N<id>(owner_id)')
         legend_entries.append('Undiscovered=<space>')
         legend_entries.append('Influence tint: 0.0=white, 0.01+=40% player color, 1.0=full player color')
         print('-----\nLEGEND:')
@@ -2273,16 +2306,22 @@ class SimpleAiController:
         if game.map is None or game.map.get_player(player_id) is None:
             return []
 
+        action_limit = game.get_player_action_limit(player_id)
+        card_limit = min(action_limit, game.get_player_card_limit(player_id))
         actions = []
         reserved_regiment_targets = set()
         reserved_city_targets = set()
-        actions.extend(self._plan_regiment_orders(game, player_id))
+        actions.extend(self._plan_card_actions(game, player_id, action_limit, card_limit))
+        if len(actions) < action_limit:
+            actions.extend(self._plan_regiment_orders(game, player_id, action_limit - len(actions)))
 
         regiments = sorted(
             game.get_player_regiments(player_id),
             key=lambda regiment: (-regiment.total_units(), regiment.id),
         )
         for regiment in regiments:
+            if len(actions) >= action_limit:
+                break
             if game.map.get_regiment(regiment.id) is None:
                 continue
             action = self._plan_regiment_action(
@@ -2299,9 +2338,11 @@ class SimpleAiController:
                 reserved_regiment_targets.add(action['target_id'])
             elif action['action_type'] == 'attack_city':
                 reserved_city_targets.add(action['target_id'])
-        return actions
+        return actions[:action_limit]
 
-    def _plan_regiment_orders(self, game, player_id: int):
+    def _plan_regiment_orders(self, game, player_id: int, available_slots: int):
+        if available_slots <= 0:
+            return []
         owned_cities = sorted(
             game.get_player_cities(player_id),
             key=lambda city: (not city.is_capital, -city.population, city.id),
@@ -2309,12 +2350,28 @@ class SimpleAiController:
         if not owned_cities:
             return []
 
-        active_regiments = len(game.get_player_regiments(player_id))
+        owned_regiments = game.get_player_regiments(player_id)
+        active_regiments = len([regiment for regiment in owned_regiments if not regiment.is_navy()])
+        active_navies = len([regiment for regiment in owned_regiments if regiment.is_navy()])
         queued_regiments = sum(
             1 for order in game.regiment_build_queue
-            if order['owner_id'] == player_id
+            if order['owner_id'] == player_id and order.get('force_kind', 'regiment') == 'regiment'
+        )
+        queued_navies = sum(
+            1 for order in game.regiment_build_queue
+            if order['owner_id'] == player_id and order.get('force_kind', 'regiment') == 'navy'
         )
         desired_regiments = max(2, len(owned_cities) * 2)
+        owned_sea_tiles = game.get_player_owned_sea_tiles(player_id)
+        influence_score = game.map.get_player_total_influence_score(player_id)
+        desired_navies = 0
+        if owned_sea_tiles:
+            desired_navies = 1
+            if influence_score >= 30000:
+                desired_navies += 1
+            if influence_score >= 70000:
+                desired_navies += 1
+            desired_navies = min(desired_navies, max(1, len(owned_cities)))
         if active_regiments + queued_regiments >= desired_regiments:
             threatened_cities = {
                 city.id for city in owned_cities
@@ -2325,11 +2382,32 @@ class SimpleAiController:
 
         actions = []
         queued_this_turn = active_regiments + queued_regiments
+        queued_navies_total = active_navies + queued_navies
         for city in owned_cities:
+            if len(actions) >= available_slots:
+                break
             if not city.can_queue_regiment():
                 continue
             if game.has_regiment_order_for_city(city.id):
                 continue
+            if queued_navies_total < desired_navies:
+                spawn_pos = self._find_best_navy_spawn_tile(game, player_id, city, owned_sea_tiles)
+                if spawn_pos is not None:
+                    navy_name = f'{city.name} Fleet T{game.turn}'
+                    actions.append({
+                        'action_type': 'queue_navy',
+                        'player_id': player_id,
+                        'actor_id': city.id,
+                        'target_id': city.id,
+                        'target_pos': spawn_pos,
+                        'metadata': {
+                            'regiment_name': navy_name,
+                            'spawn_pos': spawn_pos,
+                            'priority': 110 if city.is_capital else 90,
+                        },
+                    })
+                    queued_navies_total += 1
+                    continue
             should_queue = queued_this_turn < desired_regiments or city.id in threatened_cities
             if not should_queue:
                 continue
@@ -2347,6 +2425,176 @@ class SimpleAiController:
             })
             queued_this_turn += 1
         return actions
+
+    def _plan_card_actions(self, game, player_id: int, action_limit: int, card_limit: int):
+        player = game.map.get_player(player_id)
+        if player is None or player.deck is None or not player.can_play_cards() or not player.hand:
+            return []
+
+        actions = []
+        card_budget = min(card_limit, max(1, math.ceil(action_limit / 2)))
+        for card in sorted(
+            player.hand,
+            key=lambda candidate: (
+                -CardLibrary.RARITY_ORDER.get(candidate.definition.rarity, 0),
+                0 if candidate.definition.card_type == 'duration' else 1,
+                candidate.instance_id,
+            ),
+        ):
+            if len(actions) >= min(action_limit, card_budget):
+                break
+            action = self._build_card_action(game, player, card)
+            if action is not None:
+                actions.append(action)
+        return actions
+
+    def _find_best_navy_spawn_tile(self, game, player_id: int, city: City, owned_sea_tiles: list[tuple[int, int]]):
+        if not owned_sea_tiles:
+            return None
+        city_location = game.map.get_city_location(city.id)
+        enemy_city_locations = [
+            game.map.get_city_location(enemy_city.id)
+            for enemy_city in game.get_visible_enemy_cities(player_id)
+            if game.map.get_city_location(enemy_city.id) is not None
+        ]
+        return min(
+            owned_sea_tiles,
+            key=lambda position: (
+                0 if game.map.tiles[position].influence_owner_id == player_id else 1,
+                min(
+                    (game.map.get_tile_distance(position, enemy_position) for enemy_position in enemy_city_locations),
+                    default=game.map.get_tile_distance(position, city_location) if city_location is not None else 99,
+                ),
+                game.map.get_tile_distance(position, city_location) if city_location is not None else 99,
+                position,
+            ),
+        )
+
+    def _build_card_action(self, game, player: Player, card: Card):
+        payload = {}
+        target_scope = card.definition.target_scope
+        effect_types = {effect.effect_type for effect in card.definition.effects}
+
+        if target_scope == 'own_regiment':
+            target = self._choose_card_friendly_regiment(game, player.id, effect_types)
+            if target is None:
+                return None
+            payload['target_kind'] = 'regiment'
+            payload['target_id'] = target.id
+        elif target_scope == 'enemy_regiment':
+            target = self._choose_card_enemy_regiment(game, player.id)
+            if target is None:
+                return None
+            payload['target_kind'] = 'regiment'
+            payload['target_id'] = target.id
+        elif target_scope == 'own_city':
+            target = self._choose_card_friendly_city(game, player.id)
+            if target is None:
+                return None
+            payload['target_kind'] = 'city'
+            payload['target_id'] = target.id
+        elif target_scope == 'enemy_city':
+            target = self._choose_card_enemy_city(game, player.id)
+            if target is None:
+                return None
+            payload['target_kind'] = 'city'
+            payload['target_id'] = target.id
+        elif target_scope == 'enemy_player':
+            target = self._choose_card_enemy_player(game, player.id)
+            if target is None:
+                return None
+            payload['target_kind'] = 'player'
+            payload['target_id'] = target.id
+        elif target_scope not in {'self', 'none'}:
+            return None
+
+        if 'modify_regiment_units' in effect_types:
+            regiment = game.map.get_regiment(payload.get('target_id')) if payload.get('target_kind') == 'regiment' else None
+            if regiment is None:
+                return None
+            effect = next(effect for effect in card.definition.effects if effect.effect_type == 'modify_regiment_units')
+            payload['unit_type'] = self._choose_card_unit_type(regiment, int(effect.magnitude))
+            if payload['unit_type'] is None:
+                return None
+
+        if 'gain_random_card_by_rarity' in effect_types:
+            influence_score = game.map.get_player_total_influence_score(player.id)
+            payload['rarity'] = 'legendary' if influence_score >= 90000 else 'rare' if influence_score >= 40000 else 'uncommon'
+
+        if 'choose_from_top_cards' in effect_types:
+            payload['choice_index'] = 0
+
+        return {
+            'action_type': 'play_card',
+            'player_id': player.id,
+            'metadata': {
+                'card_instance_id': card.instance_id,
+                'card_name': card.definition.name,
+                'target_payload': payload,
+            },
+        }
+
+    def _choose_card_friendly_regiment(self, game, player_id: int, effect_types: set[str]):
+        regiments = game.get_player_regiments(player_id)
+        if 'grant_terrain_boundary_pass' in effect_types:
+            regiments = [regiment for regiment in regiments if not regiment.is_navy()]
+        if not regiments:
+            return None
+        return max(
+            regiments,
+            key=lambda regiment: (
+                regiment.effective_city_attack_score() + regiment.effective_regiment_attack_score(),
+                regiment.total_units(),
+                -regiment.id,
+            ),
+        )
+
+    def _choose_card_enemy_regiment(self, game, player_id: int):
+        enemy_regiments = game.get_visible_enemy_regiments(player_id)
+        if not enemy_regiments:
+            return None
+        return max(
+            enemy_regiments,
+            key=lambda regiment: (
+                regiment.effective_regiment_attack_score(),
+                regiment.total_units(),
+                -regiment.id,
+            ),
+        )
+
+    def _choose_card_friendly_city(self, game, player_id: int):
+        cities = game.get_player_cities(player_id)
+        if not cities:
+            return None
+        return max(cities, key=lambda city: (city.is_capital, city.population, -city.id))
+
+    def _choose_card_enemy_city(self, game, player_id: int):
+        cities = game.get_visible_enemy_cities(player_id)
+        if not cities:
+            return None
+        return max(cities, key=lambda city: (city.is_capital, city.population, -city.id))
+
+    def _choose_card_enemy_player(self, game, player_id: int):
+        opponents = [
+            player for player in game.map.players.values()
+            if player.id != player_id
+        ]
+        if not opponents:
+            return None
+        return max(
+            opponents,
+            key=lambda opponent: (
+                game.map.get_player_total_influence_score(opponent.id),
+                -opponent.id,
+            ),
+        )
+
+    def _choose_card_unit_type(self, regiment: Regiment, magnitude: int):
+        if magnitude > 0:
+            return 'navy' if regiment.is_navy() else 'infantry'
+        candidate_types = ['navy'] if regiment.is_navy() else ['infantry', 'ranged', 'cavalry', 'siege']
+        available = [unit_type for unit_type in candidate_types if getattr(regiment, unit_type) > 0]
+        return max(available, key=lambda unit_type: getattr(regiment, unit_type), default=None)
 
     def _plan_regiment_action(self, game, player_id: int, regiment: Regiment,
                               reserved_regiment_targets: set[int], reserved_city_targets: set[int]):
@@ -2515,7 +2763,7 @@ class SimpleAiController:
                 tile = game.map.tiles[(x, y)]
                 if tile.regiment_id is not None:
                     continue
-                if not tile.passable_foot and not regiment.terrain_boundary_pass_enabled:
+                if not game.map.can_place_regiment_on_tile(regiment, tile):
                     continue
                 score = self._score_position(game, player_id, (x, y), objectives)
                 if score > best_score + 4:
@@ -2626,6 +2874,7 @@ class Game:
         self.influence_victory_threshold = None
         self.turn_order = []
         self.current_turn_player_index = 0
+        self.round_planned_actions: dict[int, list[dict]] = {}
         self.last_round_summary = None
 
     def get_selected_player(self):
@@ -2658,6 +2907,339 @@ class Game:
             ordered_player_ids = ordered_player_ids[selected_index:] + ordered_player_ids[:selected_index]
         self.turn_order = ordered_player_ids
         self.current_turn_player_index = 0
+        self._reset_round_planned_actions()
+
+    def _reset_round_planned_actions(self):
+        if self.map is None:
+            self.round_planned_actions = {}
+            return
+        self.round_planned_actions = {
+            player_id: [] for player_id in sorted(self.map.players)
+        }
+
+    def _ensure_round_plan_entry(self, player_id: int):
+        if player_id not in self.round_planned_actions:
+            self.round_planned_actions[player_id] = []
+        return self.round_planned_actions[player_id]
+
+    def get_player_planned_actions(self, player_id: int):
+        return list(self._ensure_round_plan_entry(player_id))
+
+    def get_player_planned_action_count(self, player_id: int):
+        return len(self._ensure_round_plan_entry(player_id))
+
+    def get_player_planned_card_count(self, player_id: int):
+        return sum(
+            1 for action in self._ensure_round_plan_entry(player_id)
+            if action['action_type'] == 'play_card'
+        )
+
+    def get_player_planned_card_instance_ids(self, player_id: int):
+        return {
+            action.get('metadata', {}).get('card_instance_id')
+            for action in self._ensure_round_plan_entry(player_id)
+            if action['action_type'] == 'play_card'
+        }
+
+    def get_player_action_limit(self, player_id: int):
+        if self.map is None:
+            return 3
+        influence_score = self.map.get_player_total_influence_score(player_id)
+        return 3 + max(0, int(influence_score // 10000))
+
+    def get_player_card_limit(self, player_id: int):
+        if self.map is None:
+            return 2
+        influence_score = self.map.get_player_total_influence_score(player_id)
+        if influence_score < 10000:
+            return 2
+        return min(5, 2 + int((influence_score - 10000) // 30000))
+
+    def _get_card_from_player_hand_by_instance_id(self, player: Player, card_instance_id: int):
+        for card in player.hand:
+            if card.instance_id == card_instance_id:
+                return card
+        return None
+
+    def _get_player_card_hand_index_by_instance_id(self, player: Player, card_instance_id: int):
+        for index, card in enumerate(player.hand):
+            if card.instance_id == card_instance_id:
+                return index
+        return None
+
+    def _resolve_action_target_owner_id(self, action: dict):
+        if self.map is None:
+            return None
+        action_type = action['action_type']
+        if action_type == 'attack_regiment':
+            target_regiment = self.map.get_regiment(action['target_id'])
+            return None if target_regiment is None else target_regiment.owner_id
+        if action_type == 'attack_city':
+            target_city = self.map.get_city(action['target_id'])
+            return None if target_city is None else target_city.owner_id
+        if action_type == 'play_card':
+            payload = action.get('metadata', {}).get('target_payload', {})
+            target_kind = payload.get('target_kind')
+            target_id = payload.get('target_id')
+            if target_kind == 'player':
+                return target_id
+            if target_kind == 'regiment':
+                target_regiment = self.map.get_regiment(target_id)
+                return None if target_regiment is None else target_regiment.owner_id
+            if target_kind == 'city':
+                target_city = self.map.get_city(target_id)
+                return None if target_city is None else target_city.owner_id
+        return None
+
+    def describe_planned_action(self, action: dict):
+        action_type = action['action_type']
+        metadata = action.get('metadata', {})
+        if action_type in {'queue_regiment', 'queue_navy'}:
+            city = self.map.get_city(action['target_id']) if self.map is not None else None
+            city_name = city.name if city is not None else f'City {action["target_id"]}'
+            regiment_name = metadata.get('regiment_name', f'{city_name} Guard')
+            if action_type == 'queue_navy':
+                return f'Queue navy "{regiment_name}" from {city_name} to {metadata.get("spawn_pos")}'
+            return f'Queue regiment "{regiment_name}" at {city_name}'
+        if action_type == 'move_regiment':
+            return f'Move Regiment {action["actor_id"]} to {action["target_pos"]}'
+        if action_type == 'attack_regiment':
+            return f'Regiment {action["actor_id"]} attack Regiment {action["target_id"]}'
+        if action_type == 'attack_city':
+            return f'Regiment {action["actor_id"]} attack City {action["target_id"]}'
+        if action_type == 'defend_regiment':
+            return f'Regiment {action["actor_id"]} defend'
+        if action_type == 'play_card':
+            card_name = metadata.get('card_name', f'Card {metadata.get("card_instance_id")}')
+            payload = metadata.get('target_payload', {})
+            target_kind = payload.get('target_kind')
+            target_id = payload.get('target_id')
+            if target_kind is not None and target_id is not None:
+                return f'Play "{card_name}" on {target_kind} {target_id}'
+            return f'Play "{card_name}"'
+        raise ValueError(f'Unsupported planned action type: {action_type}')
+
+    def print_player_planned_actions(self, player_id: int):
+        player = self.map.get_player(player_id) if self.map is not None else None
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist')
+        planned_actions = self.get_player_planned_actions(player_id)
+        action_limit = self.get_player_action_limit(player_id)
+        card_limit = min(action_limit, self.get_player_card_limit(player_id))
+        print(
+            f'PLANNED ACTIONS: {len(planned_actions)}/{action_limit} | '
+            f'cards={self.get_player_planned_card_count(player_id)}/{card_limit}'
+        )
+        if not planned_actions:
+            print('  No actions planned yet.')
+            print('')
+            return
+        for index, action in enumerate(planned_actions, start=1):
+            print(f'  {index}. {self.describe_planned_action(action)}')
+        print('')
+
+    def _validate_planned_action(self, player_id: int, action: dict):
+        if self.map is None:
+            raise ValueError('A map must be loaded before planning actions.')
+        action_type = action['action_type']
+        metadata = action.setdefault('metadata', {})
+
+        if action_type in {'queue_regiment', 'queue_navy'}:
+            city = self.map.get_city(action['target_id'])
+            if city is None:
+                raise ValueError(f'City {action["target_id"]} does not exist.')
+            if city.owner_id != player_id:
+                raise ValueError(f'City {city.id} belongs to another empire.')
+            if not city.can_queue_regiment():
+                raise ValueError(
+                    f'{city.name} cannot produce regiments for {city.regiment_production_lock_turns_remaining} more turn(s) '
+                    f'while the occupation is being stabilized.'
+                )
+            if self.has_regiment_order_for_city(city.id):
+                raise ValueError(f'{city.name} already has a regiment in production.')
+            if any(
+                queued_action['action_type'] in {'queue_regiment', 'queue_navy'} and queued_action['target_id'] == city.id
+                for queued_action in self._ensure_round_plan_entry(player_id)
+            ):
+                raise ValueError(f'{city.name} already has a planned force order this turn.')
+            if action_type == 'queue_navy':
+                spawn_pos = metadata.get('spawn_pos')
+                if spawn_pos is None or len(spawn_pos) != 2:
+                    raise ValueError('Navy plans require a sea tile spawn position.')
+                self._validate_navy_spawn_tile(player_id, int(spawn_pos[0]), int(spawn_pos[1]))
+            return action
+
+        if action_type == 'move_regiment':
+            regiment = self.map.get_regiment(action['actor_id'])
+            if regiment is None:
+                raise ValueError(f'Regiment {action["actor_id"]} does not exist.')
+            if regiment.owner_id != player_id:
+                raise ValueError(f'Regiment {regiment.id} belongs to another empire.')
+            if self.map.get_regiment_location(regiment.id) is None:
+                raise ValueError(f'Regiment {regiment.id} is not on the map.')
+            target_x, target_y = action['target_pos']
+            if (target_x, target_y) not in self.map.tiles:
+                raise ValueError(f'Target tile ({target_x}, {target_y}) is out of bounds.')
+            target_tile = self.map.tiles[(target_x, target_y)]
+            if target_tile.regiment_id is not None:
+                raise ValueError(f'Target tile ({target_x}, {target_y}) already has a regiment.')
+            if not self.map.can_place_regiment_on_tile(regiment, target_tile):
+                if regiment.is_navy():
+                    raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for navy forces.')
+                raise ValueError(f'Target tile ({target_x}, {target_y}) is not passable for land regiments.')
+            distance = self.map.get_tile_distance(self.map.get_regiment_location(regiment.id), (target_x, target_y))
+            if not regiment.can_move_distance(distance):
+                raise ValueError(
+                    f'Regiment {regiment.id} has {regiment.movement_remaining()} movement remaining this turn '
+                    f'and cannot move {distance} tiles.'
+                )
+            return action
+
+        if action_type == 'attack_regiment':
+            attacker = self.map.get_regiment(action['actor_id'])
+            defender = self.map.get_regiment(action['target_id'])
+            if attacker is None:
+                raise ValueError(f'Regiment {action["actor_id"]} does not exist.')
+            if attacker.owner_id != player_id:
+                raise ValueError(f'Regiment {attacker.id} belongs to another empire.')
+            if defender is None:
+                raise ValueError(f'Regiment {action["target_id"]} does not exist.')
+            if defender.owner_id == player_id:
+                raise ValueError('Friendly fire is not allowed.')
+            if not self.map.is_regiment_visible_to_player(defender.id, player_id):
+                raise ValueError(f'Regiment {defender.id} is not currently visible to your empire.')
+            if not attacker.can_attack_this_turn():
+                raise ValueError(
+                    f'Regiment {attacker.id} cannot attack again this turn '
+                    f'(movement remaining={attacker.movement_remaining()}, '
+                    f'attacks remaining={max(0, attacker.max_attacks_per_turn() - attacker.attacks_made_this_turn)}).'
+                )
+            if attacker.is_defending:
+                raise ValueError(f'Regiment {attacker.id} is defending and cannot attack this turn.')
+            attack_distance = self.map.get_tile_distance(
+                self.map.get_regiment_location(attacker.id),
+                self.map.get_regiment_location(defender.id),
+            )
+            if not attacker.can_attack_distance(attack_distance):
+                raise ValueError(
+                    f'Regiment {attacker.id} may attack up to {attacker.attack_range()} tile(s), '
+                    f'but Regiment {defender.id} is {attack_distance} tile(s) away.'
+                )
+            metadata['target_owner_id'] = defender.owner_id
+            return action
+
+        if action_type == 'attack_city':
+            attacker = self.map.get_regiment(action['actor_id'])
+            city = self.map.get_city(action['target_id'])
+            if attacker is None:
+                raise ValueError(f'Regiment {action["actor_id"]} does not exist.')
+            if attacker.owner_id != player_id:
+                raise ValueError(f'Regiment {attacker.id} belongs to another empire.')
+            if city is None:
+                raise ValueError(f'City {action["target_id"]} does not exist.')
+            if city.owner_id == player_id:
+                raise ValueError('Friendly fire is not allowed.')
+            if not self.map.is_city_visible_to_player(city.id, player_id):
+                raise ValueError(f'City {city.id} is not currently visible to your empire.')
+            if not attacker.can_attack_this_turn():
+                raise ValueError(
+                    f'Regiment {attacker.id} cannot attack again this turn '
+                    f'(movement remaining={attacker.movement_remaining()}, '
+                    f'attacks remaining={max(0, attacker.max_attacks_per_turn() - attacker.attacks_made_this_turn)}).'
+                )
+            if attacker.is_defending:
+                raise ValueError(f'Regiment {attacker.id} is defending and cannot attack this turn.')
+            attack_distance = self.map.get_tile_distance(
+                self.map.get_regiment_location(attacker.id),
+                self.map.get_city_location(city.id),
+            )
+            if not attacker.can_attack_distance(attack_distance):
+                raise ValueError(
+                    f'Regiment {attacker.id} may attack up to {attacker.attack_range()} tile(s), '
+                    f'but City {city.id} is {attack_distance} tile(s) away.'
+                )
+            metadata['target_owner_id'] = city.owner_id
+            return action
+
+        if action_type == 'defend_regiment':
+            regiment = self.map.get_regiment(action['actor_id'])
+            if regiment is None:
+                raise ValueError(f'Regiment {action["actor_id"]} does not exist.')
+            if regiment.owner_id != player_id:
+                raise ValueError(f'Regiment {regiment.id} belongs to another empire.')
+            if regiment.total_units() == 0:
+                raise ValueError(f'Regiment {regiment.id} has no units remaining.')
+            if self.map.get_regiment_location(regiment.id) is None:
+                raise ValueError(f'Regiment {regiment.id} is not on the map.')
+            if regiment.movement_remaining() < 1:
+                raise ValueError(f'Regiment {regiment.id} has no movement remaining to defend.')
+            if regiment.is_defending:
+                raise ValueError(f'Regiment {regiment.id} is already defending this turn.')
+            return action
+
+        if action_type == 'play_card':
+            if self.turn <= self.card_unlock_turn:
+                raise ValueError(f'Cards cannot be played until after turn {self.card_unlock_turn}.')
+            player = self.map.get_player(player_id)
+            if player is None:
+                raise ValueError(f'Player {player_id} does not exist.')
+            if player.deck is None:
+                raise ValueError(f'Player {player_id} does not have a deck.')
+            if not player.can_play_cards():
+                raise ValueError(f'{player.name} is currently prevented from playing cards.')
+            card_instance_id = metadata.get('card_instance_id')
+            card = self._get_card_from_player_hand_by_instance_id(player, card_instance_id)
+            if card is None:
+                raise ValueError(f'Card {card_instance_id} is no longer in hand.')
+            if card_instance_id in self.get_player_planned_card_instance_ids(player_id):
+                raise ValueError(f'"{card.definition.name}" is already planned to be played this turn.')
+            resolved_target = self._resolve_card_target(player, card.definition, metadata.get('target_payload', {}))
+            metadata['card_name'] = card.definition.name
+            if resolved_target['target_kind'] == 'player':
+                metadata['target_owner_id'] = resolved_target['target_id']
+            elif resolved_target['target_kind'] == 'regiment' and resolved_target.get('entity') is not None:
+                metadata['target_owner_id'] = resolved_target['entity'].owner_id
+            elif resolved_target['target_kind'] == 'city' and resolved_target.get('entity') is not None:
+                metadata['target_owner_id'] = resolved_target['entity'].owner_id
+            return action
+
+        raise ValueError(f'Unsupported action type: {action_type}')
+
+    def queue_action_for_player(self, player_id: int, action: dict):
+        if self.map is None:
+            raise ValueError('A map must be loaded before planning actions.')
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist.')
+        current_player = self.get_current_turn_player()
+        if current_player is None or current_player.id != player_id:
+            raise ValueError(f'It is not {player.name}\'s planning phase.')
+
+        normalized_action = dict(action)
+        normalized_action['player_id'] = player_id
+        normalized_action['metadata'] = dict(action.get('metadata', {}))
+
+        action_limit = self.get_player_action_limit(player_id)
+        planned_count = self.get_player_planned_action_count(player_id)
+        if planned_count >= action_limit:
+            raise ValueError(f'{player.name} has already planned the maximum {action_limit} action(s) this turn.')
+
+        if normalized_action['action_type'] == 'play_card':
+            card_limit = min(action_limit, self.get_player_card_limit(player_id))
+            if self.get_player_planned_card_count(player_id) >= card_limit:
+                raise ValueError(f'{player.name} has already planned the maximum {card_limit} card play(s) this turn.')
+
+        normalized_action['metadata']['target_owner_id'] = self._resolve_action_target_owner_id(normalized_action)
+        normalized_action = self._validate_planned_action(player_id, normalized_action)
+        self._ensure_round_plan_entry(player_id).append(normalized_action)
+        return {
+            'queued': True,
+            'action': normalized_action,
+            'action_count': self.get_player_planned_action_count(player_id),
+            'action_limit': action_limit,
+            'card_count': self.get_player_planned_card_count(player_id),
+            'card_limit': min(action_limit, self.get_player_card_limit(player_id)),
+        }
 
     def get_player_regiments(self, player_id: int):
         if self.map is None:
@@ -2700,6 +3282,14 @@ class Game:
             for order in self.regiment_build_queue
         )
 
+    def get_player_owned_sea_tiles(self, player_id: int):
+        if self.map is None:
+            return []
+        return [
+            position for position, tile in sorted(self.map.tiles.items())
+            if tile.passable_water and tile.influence_owner_id == player_id and not tile.is_influence_contested
+        ]
+
     def _deduplicate_messages(self, messages: list[str]):
         unique_messages = []
         seen_messages = set()
@@ -2712,6 +3302,9 @@ class Game:
 
     def _determine_regiment_build_turns(self, city: City):
         return max(1, min(6, math.ceil(3000 / max(city.population, 1))))
+
+    def _determine_navy_build_turns(self, city: City):
+        return max(2, min(8, self._determine_regiment_build_turns(city) + 2))
 
     def _create_random_regiment_for_city(self, city: City, owner_id: int, regiment_name: str):
         total_units = max(8, city.population // 45 + self.random.randint(0, max(3, city.population // 200)))
@@ -2732,7 +3325,32 @@ class Game:
             heroes=heroes,
         )
 
-    def queue_regiment_order(self, player_id: int, city_id: int, regiment_name: str = None):
+    def _create_random_navy_for_city(self, city: City, owner_id: int, regiment_name: str):
+        total_units = max(4, city.population // 120 + self.random.randint(0, max(2, city.population // 450)))
+        heroes = [f'Admiral_{self.random.randint(1, 999)}'] if self.random.random() < 0.20 else []
+        return Regiment(
+            name=regiment_name,
+            owner_id=owner_id,
+            navy=total_units,
+            heroes=heroes,
+        )
+
+    def _validate_navy_spawn_tile(self, player_id: int, spawn_x: int, spawn_y: int):
+        if self.map is None:
+            raise ValueError('A map must be loaded before queueing navies.')
+        if (spawn_x, spawn_y) not in self.map.tiles:
+            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) is out of bounds.')
+        spawn_tile = self.map.tiles[(spawn_x, spawn_y)]
+        if not spawn_tile.passable_water:
+            raise ValueError(f'Tile ({spawn_x}, {spawn_y}) is not a sea tile.')
+        if spawn_tile.regiment_id is not None:
+            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) already has a force on it.')
+        if spawn_tile.influence_owner_id != player_id or spawn_tile.is_influence_contested:
+            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) is not securely owned by your empire.')
+        return spawn_tile
+
+    def _queue_force_order(self, player_id: int, city_id: int, regiment_name: str = None,
+                           force_kind: str = 'regiment', spawn_pos: tuple[int, int] = None):
         if self.map is None:
             raise ValueError('A map must be loaded before queueing regiments.')
         city = self.map.get_city(city_id)
@@ -2748,14 +3366,32 @@ class Game:
         if self.has_regiment_order_for_city(city.id):
             raise ValueError(f'{city.name} already has a regiment in production.')
 
+        normalized_force_kind = str(force_kind).strip().lower()
+        if normalized_force_kind not in {'regiment', 'navy'}:
+            raise ValueError(f'Unsupported force kind: {force_kind}')
+
         selected_name = str(regiment_name).strip() if regiment_name is not None else ''
         if not selected_name:
-            selected_name = f'{city.name} Guard'
-        turns_to_build = self._determine_regiment_build_turns(city)
+            selected_name = f'{city.name} {"Fleet" if normalized_force_kind == "navy" else "Guard"}'
+
+        spawn_position = None
+        if normalized_force_kind == 'navy':
+            if spawn_pos is None:
+                raise ValueError('A sea tile spawn position is required when queueing a navy.')
+            spawn_position = (int(spawn_pos[0]), int(spawn_pos[1]))
+            self._validate_navy_spawn_tile(player_id, spawn_position[0], spawn_position[1])
+
+        turns_to_build = (
+            self._determine_navy_build_turns(city)
+            if normalized_force_kind == 'navy' else
+            self._determine_regiment_build_turns(city)
+        )
         self.regiment_build_queue.append({
             'city_id': city.id,
             'owner_id': city.owner_id,
             'regiment_name': selected_name,
+            'force_kind': normalized_force_kind,
+            'spawn_pos': spawn_position,
             'turns_remaining': turns_to_build,
             'queued_on_turn': self.turn,
         })
@@ -2764,8 +3400,22 @@ class Game:
             'city_id': city.id,
             'owner_id': city.owner_id,
             'regiment_name': selected_name,
+            'force_kind': normalized_force_kind,
+            'spawn_pos': spawn_position,
             'turns_to_build': turns_to_build,
         }
+
+    def queue_regiment_order(self, player_id: int, city_id: int, regiment_name: str = None):
+        return self._queue_force_order(player_id, city_id, regiment_name=regiment_name, force_kind='regiment')
+
+    def queue_navy_order(self, player_id: int, city_id: int, spawn_x: int, spawn_y: int, regiment_name: str = None):
+        return self._queue_force_order(
+            player_id,
+            city_id,
+            regiment_name=regiment_name,
+            force_kind='navy',
+            spawn_pos=(spawn_x, spawn_y),
+        )
 
     def cancel_regiment_order(self, player_id: int, city_id: int):
         if self.map is None:
@@ -2784,6 +3434,7 @@ class Game:
                 'canceled': True,
                 'city_id': city_id,
                 'regiment_name': order['regiment_name'],
+                'force_kind': order.get('force_kind', 'regiment'),
                 'turns_remaining': order['turns_remaining'],
             }
         raise ValueError(f'{city.name} has no regiment currently in production.')
@@ -2888,6 +3539,8 @@ class Game:
 
             city = self.map.get_city(order['city_id'])
             city_location = self.map.get_city_location(order['city_id'])
+            force_kind = order.get('force_kind', 'regiment')
+            spawn_position = tuple(order['spawn_pos']) if order.get('spawn_pos') is not None else city_location
             is_visible_to_viewer = (
                 viewer_player_id is None or order['owner_id'] == viewer_player_id
             )
@@ -2906,16 +3559,58 @@ class Game:
             if not city.can_queue_regiment():
                 order['turns_remaining'] = max(order['turns_remaining'], 1)
                 continue
+            if force_kind == 'navy':
+                if spawn_position not in self.map.tiles:
+                    if is_visible_to_viewer:
+                        messages.append(
+                            f'Build order canceled for navy at city {city.id}: sea tile {spawn_position} is out of bounds.'
+                        )
+                    completed_orders.append(order)
+                    continue
+                spawn_tile = self.map.tiles[spawn_position]
+                if not spawn_tile.passable_water:
+                    if is_visible_to_viewer:
+                        messages.append(
+                            f'Build order canceled for navy at city {city.id}: tile {spawn_position} is no longer sea.'
+                        )
+                    completed_orders.append(order)
+                    continue
+                if spawn_tile.influence_owner_id != order['owner_id'] or spawn_tile.is_influence_contested:
+                    if is_visible_to_viewer:
+                        messages.append(
+                            f'Build order canceled for navy at city {city.id}: sea tile {spawn_position} is no longer securely owned.'
+                        )
+                    completed_orders.append(order)
+                    continue
+                if spawn_tile.regiment_id is not None:
+                    if is_visible_to_viewer:
+                        messages.append(
+                            f'Build order delayed for city {city.id}: sea tile {spawn_position} is currently occupied.'
+                        )
+                    order['turns_remaining'] = 1
+                    continue
 
             try:
-                regiment = self._create_random_regiment_for_city(
-                    city=city,
-                    owner_id=order['owner_id'],
-                    regiment_name=order['regiment_name'],
+                regiment = (
+                    self._create_random_navy_for_city(
+                        city=city,
+                        owner_id=order['owner_id'],
+                        regiment_name=order['regiment_name'],
+                    ) if force_kind == 'navy' else
+                    self._create_random_regiment_for_city(
+                        city=city,
+                        owner_id=order['owner_id'],
+                        regiment_name=order['regiment_name'],
+                    )
                 )
-                self.map.add_regiment(regiment, city_location[0], city_location[1])
+                self.map.add_regiment(regiment, spawn_position[0], spawn_position[1])
                 if is_visible_to_viewer:
-                    messages.append(f'Regiment formed: {regiment.symbol()} at city {city.name}.')
+                    if force_kind == 'navy':
+                        messages.append(
+                            f'Navy formed: {regiment.symbol()} launched from {city.name} at sea tile {spawn_position}.'
+                        )
+                    else:
+                        messages.append(f'Regiment formed: {regiment.symbol()} at city {city.name}.')
                 completed_orders.append(order)
             except ValueError as error:
                 if is_visible_to_viewer:
@@ -2935,14 +3630,21 @@ class Game:
 
         if not visible_orders:
             if show_empty_message:
-                print('No regiments are currently queued for production for your empire.')
+                print('No land or naval forces are currently queued for production for your empire.')
             return
 
-        print('REGIMENT BUILD QUEUE:')
+        print('FORCE BUILD QUEUE:')
         for order in visible_orders:
             city = self.map.get_city(order['city_id']) if self.map is not None else None
             city_name = city.name if city is not None else f'City {order["city_id"]}'
             turns_remaining = max(0, order['turns_remaining'])
+            force_kind = order.get('force_kind', 'regiment')
+            if force_kind == 'navy':
+                print(
+                    f"  {turns_remaining} turn(s) until Navy '{order['regiment_name']}' appears at sea tile "
+                    f'{tuple(order["spawn_pos"])} from {city_name}.'
+                )
+                continue
             print(
                 f"  {turns_remaining} turn(s) until Regiment '{order['regiment_name']}' "
                 f'appears at {city_name}.'
@@ -2999,10 +3701,11 @@ class Game:
         for regiment in regiments:
             self.map.print_regiment_metadata(regiment)
 
-    def begin_round(self):
+    def begin_round(self, resolution_messages: list[str] = None):
         if self.map is None:
             raise ValueError('A map must be loaded before starting a round.')
         self.turn += 1
+        self._reset_round_planned_actions()
         expiration_messages = self.process_active_card_effects_for_new_turn(
             viewer_player_id=self.selected_player_id
         )
@@ -3014,6 +3717,7 @@ class Game:
         draw_messages = self.process_influence_card_draws(viewer_player_id=self.selected_player_id)
         victory_result = self.evaluate_victory_conditions()
         self.last_round_summary = {
+            'resolution_messages': list(resolution_messages or []),
             'expiration_messages': self._deduplicate_messages(expiration_messages),
             'build_messages': build_messages,
             'city_attack_messages': city_attack_messages,
@@ -3050,7 +3754,7 @@ class Game:
                     f'{city.symbol} repairs delayed: {city.siege_repair_delay_turns_remaining} turn(s) remaining | '
                     f'regiment production lock={city.regiment_production_lock_turns_remaining}'
                 )
-        for key in ('build_messages', 'city_attack_messages', 'expiration_messages', 'draw_messages'):
+        for key in ('resolution_messages', 'build_messages', 'city_attack_messages', 'expiration_messages', 'draw_messages'):
             for message in summary.get(key, []):
                 print(message)
 
@@ -3059,7 +3763,19 @@ class Game:
             return
         self.current_turn_player_index = (self.current_turn_player_index + 1) % len(self.turn_order)
         if self.current_turn_player_index == 0:
-            self.begin_round()
+            resolution_messages = self.resolve_planned_round(viewer_player_id=self.selected_player_id)
+            if not self.player_in_loop:
+                self.last_round_summary = {
+                    'resolution_messages': resolution_messages,
+                    'expiration_messages': [],
+                    'build_messages': [],
+                    'city_attack_messages': [],
+                    'city_updates': [],
+                    'draw_messages': [],
+                    'victory_result': self.evaluate_victory_conditions(),
+                }
+                return
+            self.begin_round(resolution_messages=resolution_messages)
 
     def execute_action_for_player(self, player_id: int, action: dict):
         action_type = action['action_type']
@@ -3067,6 +3783,15 @@ class Game:
             return self.queue_regiment_order(
                 player_id,
                 action['target_id'],
+                action.get('metadata', {}).get('regiment_name'),
+            )
+        if action_type == 'queue_navy':
+            spawn_pos = action.get('metadata', {}).get('spawn_pos')
+            return self.queue_navy_order(
+                player_id,
+                action['target_id'],
+                spawn_pos[0],
+                spawn_pos[1],
                 action.get('metadata', {}).get('regiment_name'),
             )
         if action_type == 'move_regiment':
@@ -3078,7 +3803,111 @@ class Game:
             return self.attack_with_regiment(player_id, action['actor_id'], 'city', action['target_id'])
         if action_type == 'defend_regiment':
             return self.defend_regiment_for_player(player_id, action['actor_id'])
+        if action_type == 'play_card':
+            player = self.map.get_player(player_id)
+            if player is None:
+                raise ValueError(f'Player {player_id} does not exist')
+            card_instance_id = action.get('metadata', {}).get('card_instance_id')
+            hand_index = self._get_player_card_hand_index_by_instance_id(player, card_instance_id)
+            if hand_index is None:
+                raise ValueError(f'Card {card_instance_id} is no longer in hand')
+            return self.play_card_for_player(
+                player_id,
+                hand_index,
+                action.get('metadata', {}).get('target_payload', {}),
+            )
         raise ValueError(f'Unsupported action type: {action_type}')
+
+    def _action_is_visible_to_viewer(self, action: dict, viewer_player_id: int = None):
+        if viewer_player_id is None:
+            return True
+        if action['player_id'] == viewer_player_id:
+            return True
+        return action.get('metadata', {}).get('target_owner_id') == viewer_player_id
+
+    def _build_action_resolution_messages(self, player_id: int, action: dict, result):
+        player = self.map.get_player(player_id) if self.map is not None else None
+        player_name = player.name if player is not None else f'Player {player_id}'
+        action_type = action['action_type']
+        if action_type in {'queue_regiment', 'queue_navy'}:
+            city = self.map.get_city(result['city_id']) if self.map is not None else None
+            city_name = city.name if city is not None else f'City {result["city_id"]}'
+            if action_type == 'queue_navy':
+                return [
+                    f'{player_name} queued navy "{result["regiment_name"]}" from {city_name} '
+                    f'to sea tile {result["spawn_pos"]} ({result["turns_to_build"]} turn(s) to build).'
+                ]
+            return [
+                f'{player_name} queued regiment "{result["regiment_name"]}" at {city_name} '
+                f'({result["turns_to_build"]} turn(s) to build).'
+            ]
+        if action_type == 'move_regiment':
+            return [f'{player_name} moved Regiment {result["regiment_id"]} to {result["target_pos"]}.']
+        if action_type == 'defend_regiment':
+            return [f'{player_name} set Regiment {result["regiment_id"]} to defend.']
+        if action_type == 'play_card':
+            messages = [f'{player_name} played {result["card"].definition.name}.']
+            messages.extend(result['messages'])
+            return messages
+        if action_type == 'attack_regiment':
+            combat_result = result['result']
+            target_regiment = result['target']
+            attacker_losses = sum(combat_result['casualties_a'].values())
+            defender_losses = sum(combat_result['casualties_b'].values())
+            messages = [
+                f'{player_name} attacked {target_regiment.symbol()} from {combat_result["attack_distance"]} tile(s): '
+                f'attacker losses={attacker_losses}, defender losses={defender_losses}.'
+            ]
+            if combat_result['defeated_a']:
+                messages.append(f'Regiment {combat_result["regiment_a_id"]} was destroyed.')
+            if combat_result['defeated_b']:
+                messages.append(f'Regiment {combat_result["regiment_b_id"]} was destroyed.')
+            return messages
+        if action_type == 'attack_city':
+            siege_result = result['result']
+            target_city = result['target']
+            messages = [
+                f'{player_name} attacked {target_city.name}: siege resistance '
+                f'{siege_result["resistance_before"]} -> {siege_result["resistance_after"]}.'
+            ]
+            if siege_result['sacked']:
+                new_owner = self.map.get_player(siege_result['new_owner_id']) if self.map is not None else None
+                new_owner_name = new_owner.name if new_owner is not None else f'Player {siege_result["new_owner_id"]}'
+                messages.append(
+                    f'{target_city.name} was captured by {new_owner_name}; full influence returns in '
+                    f'{siege_result["occupation_recovery_turns_remaining"]} turn(s).'
+                )
+            return messages
+        return [f'{player_name} resolved {self.describe_planned_action(action)}.']
+
+    def resolve_planned_round(self, viewer_player_id: int = None):
+        if self.map is None:
+            return []
+        influence_rankings = [
+            (player.id, self.map.get_player_total_influence_score(player.id))
+            for player in self.map.players.values()
+        ]
+        influence_rankings.sort(key=lambda entry: (-entry[1], entry[0]))
+
+        messages = []
+        for player_id, _ in influence_rankings:
+            for action in list(self._ensure_round_plan_entry(player_id)):
+                if not self.player_in_loop:
+                    break
+                try:
+                    result = self.execute_action_for_player(player_id, action)
+                except ValueError as error:
+                    if self._action_is_visible_to_viewer(action, viewer_player_id):
+                        messages.append(
+                            f'{self.describe_planned_action(action)} failed during resolution: {error}'
+                        )
+                    continue
+                if self._action_is_visible_to_viewer(action, viewer_player_id):
+                    messages.extend(self._build_action_resolution_messages(player_id, action, result))
+            if not self.player_in_loop:
+                break
+        self._reset_round_planned_actions()
+        return messages
 
     def execute_computer_turn(self, player_id: int):
         player = self.map.get_player(player_id) if self.map is not None else None
@@ -3088,9 +3917,11 @@ class Game:
             if not self.player_in_loop:
                 break
             try:
-                self.execute_action_for_player(player_id, action)
+                self.queue_action_for_player(player_id, action)
             except ValueError:
                 continue
+            if self.get_player_planned_action_count(player_id) >= self.get_player_action_limit(player_id):
+                break
         if not self.player_in_loop:
             return
         self.advance_to_next_player_turn()
@@ -3211,6 +4042,8 @@ class Game:
             raise ValueError(f'Player {player_id} does not have a deck')
         if hand_index < 0 or hand_index >= len(player.hand):
             raise ValueError(f'Hand selection {hand_index + 1} is out of range')
+        if player.hand[hand_index].instance_id in self.get_player_planned_card_instance_ids(player_id):
+            raise ValueError(f'{player.hand[hand_index].definition.name} is already planned to be played this turn')
         discarded_card = player.hand.pop(hand_index)
         player.deck.discard(discarded_card)
         return {'discarded': True, 'card': discarded_card}
@@ -3230,8 +4063,12 @@ class Game:
         if player.deck is None:
             print('This player has no deck.')
             return
+        action_limit = self.get_player_action_limit(player_id)
+        card_limit = min(action_limit, self.get_player_card_limit(player_id))
+        queued_card_ids = self.get_player_planned_card_instance_ids(player_id)
         print(
             f'CARDS: hand={len(player.hand)}/{player.hand_limit()} | '
+            f'planned={self.get_player_planned_card_count(player_id)}/{card_limit} | '
             f'deck={player.deck.cards_remaining()} | discard={len(player.deck.discard_pile)} | '
             f'exhausted={len(player.deck.exhausted_pile)}'
         )
@@ -3243,6 +4080,8 @@ class Game:
             rarity_color = self.card_library.RARITY_COLORS.get(card.definition.rarity, '')
             rarity_label = card.definition.rarity.title()
             card_label = f'{index}. {card.definition.name} [{rarity_label} | {card.definition.card_type}]'
+            if card.instance_id in queued_card_ids:
+                card_label += ' [queued]'
             if rarity_color:
                 card_label = f'{rarity_color}{card_label}{Style.RESET_ALL}'
             print(f'  {card_label}')
@@ -3670,6 +4509,11 @@ class Game:
         def _parse_delta_coordinates(raw_value: str, label: str = 'Movement delta'):
             return _parse_tile_coordinates(raw_value, label=label)
 
+        def _resolve_owned_sea_tile(selection: str, owner_id: int):
+            spawn_x, spawn_y = _parse_tile_coordinates(selection, label='Sea tile')
+            self._validate_navy_spawn_tile(owner_id, spawn_x, spawn_y)
+            return (spawn_x, spawn_y)
+
         def queue_regiment_order_action():
             selected_player = self.get_selected_player()
             if selected_player is None:
@@ -3683,12 +4527,50 @@ class Game:
                 )
                 default_name = f'{city.name} Guard'
                 regiment_name = input(f'Enter regiment name (default: {default_name}): ').strip() or default_name
-                result = self.queue_regiment_order(selected_player.id, city.id, regiment_name)
-                owner = self.map.get_player(result['owner_id'])
-                owner_name = owner.name if owner is not None else f'Unknown({result["owner_id"]})'
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'queue_regiment',
+                    'target_id': city.id,
+                    'metadata': {'regiment_name': regiment_name},
+                })
                 print(
-                    f"Queued regiment '{result['regiment_name']}' for {owner_name} from {city.name}. "
-                    f"Ready in {result['turns_to_build']} turn(s)."
+                    f"Planned regiment '{regiment_name}' from {city.name}. "
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def queue_navy_order_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
+            try:
+                city = _resolve_owned_city(
+                    input('Enter friendly city id or exact name to queue from: ').strip(),
+                    selected_player.id,
+                )
+                owned_sea_tiles = self.get_player_owned_sea_tiles(selected_player.id)
+                if not owned_sea_tiles:
+                    raise ValueError('Your empire does not currently control any uncontested sea tiles.')
+                print(f'Owned sea tiles: {", ".join(str(position) for position in owned_sea_tiles)}')
+                spawn_pos = _resolve_owned_sea_tile(
+                    input('Enter owned sea tile for the navy to launch from as x y: ').strip(),
+                    selected_player.id,
+                )
+                default_name = f'{city.name} Fleet'
+                navy_name = input(f'Enter navy name (default: {default_name}): ').strip() or default_name
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'queue_navy',
+                    'target_id': city.id,
+                    'metadata': {
+                        'regiment_name': navy_name,
+                        'spawn_pos': spawn_pos,
+                    },
+                })
+                print(
+                    f"Planned navy '{navy_name}' from {city.name} to sea tile {spawn_pos}. "
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                 )
             except ValueError as error:
                 print(error)
@@ -3706,7 +4588,7 @@ class Game:
                 )
                 result = self.cancel_regiment_order(selected_player.id, city.id)
                 print(
-                    f"Canceled regiment '{result['regiment_name']}' at {city.name}. "
+                    f"Canceled {result.get('force_kind', 'regiment')} '{result['regiment_name']}' at {city.name}. "
                     f'It had {max(0, result["turns_remaining"])} turn(s) remaining.'
                 )
             except ValueError as error:
@@ -3715,10 +4597,11 @@ class Game:
         def create_regiment_order():
             action_menu = ConsoleMenu()
             action_menu.add_option('Queue Regiment', queue_regiment_order_action, 'q')
-            action_menu.add_option('Cancel Queued Regiment', cancel_regiment_order_action, 'c')
-            action_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'v')
+            action_menu.add_option('Queue Navy', queue_navy_order_action, 'n')
+            action_menu.add_option('Cancel Queued Force', cancel_regiment_order_action, 'c')
+            action_menu.add_option('View Force Build Queue', print_regiment_build_queue_status, 'v')
             action_menu.add_option('Back', lambda: None, 'b')
-            print('---BUILD REGIMENT---')
+            print('---BUILD FORCE---')
             action_menu.prompt_and_select()
 
         def _normalize_lookup_name(value: str):
@@ -3777,6 +4660,17 @@ class Game:
             if not normalized:
                 raise ValueError('Attacking regiment selection cannot be empty.')
 
+            compact = normalized.replace(' ', '')
+            target_token = compact.upper()
+            if target_token.startswith(('R', 'N')) and compact[1:].isdigit():
+                regiment_id = int(compact[1:])
+                regiment = self.map.get_regiment(regiment_id)
+                if regiment is None:
+                    raise ValueError(f'Regiment {regiment_id} does not exist.')
+                if regiment.owner_id != owner_id:
+                    raise ValueError(f'Regiment {regiment_id} belongs to another empire.')
+                return regiment
+
             if normalized.isdigit():
                 regiment_id = int(normalized)
                 regiment = self.map.get_regiment(regiment_id)
@@ -3830,7 +4724,7 @@ class Game:
                 _require_target_visibility('City', city_id, self.map.get_city_location(city_id))
                 return {'kind': 'city', 'entity': city}
 
-            if target_token.startswith('R') and compact[1:].isdigit():
+            if target_token.startswith(('R', 'N')) and compact[1:].isdigit():
                 regiment_id = int(compact[1:])
                 regiment = self.map.get_regiment(regiment_id)
                 if regiment is None:
@@ -3857,7 +4751,7 @@ class Game:
             if not target_matches:
                 raise ValueError(f'No visible enemy regiment or city named "{normalized}" exists.')
             if len(target_matches) > 1:
-                raise ValueError(f'Multiple enemy targets named "{normalized}" exist. Use R#, C#, or *C# instead.')
+                raise ValueError(f'Multiple enemy targets named "{normalized}" exist. Use R#, N#, C#, or *C# instead.')
             return target_matches[0]
 
         def regiment_attack_or_defend():
@@ -3866,7 +4760,7 @@ class Game:
                 print('No empire is currently selected.')
                 return
 
-            regiment_input = input('Enter regiment id or exact name to attack/defend with: ').strip()
+            regiment_input = input('Enter regiment/navy id or exact name to attack/defend with: ').strip()
             try:
                 regiment = _resolve_owned_regiment(regiment_input, selected_player.id)
             except ValueError as error:
@@ -3876,88 +4770,44 @@ class Game:
             try:
                 action = input('Choose action: [a]ttack or [d]efend: ').strip().lower()
                 if action in ('d', 'defend'):
-                    result = self.defend_regiment_for_player(selected_player.id, regiment.id)
+                    result = self.queue_action_for_player(selected_player.id, {
+                        'action_type': 'defend_regiment',
+                        'actor_id': regiment.id,
+                    })
                     print(
-                        f'{regiment.symbol()} is defending this turn. '
-                        f'Attack score while defending: {result["effective_attack_score"]} | '
-                        f'Defense score: {result["defense_score"]} -> {result["effective_defense_score"]}.'
+                        f'Planned defensive stance for {regiment.symbol()}. '
+                        f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                     )
-                    print(f'Movement remaining after defending: {result["movement_remaining"]}.')
                     return
                 if action not in ('a', 'attack'):
                     print('Action must be "attack" or "defend".')
                     return
 
-                target_input = input('Enter target (R#, C#, *C#, or exact name): ').strip()
+                target_input = input('Enter target (R#, N#, C#, *C#, or exact name): ').strip()
                 target = _resolve_attack_target(target_input, regiment.owner_id)
                 if target['kind'] == 'regiment':
                     defending_regiment = target['entity']
-                    action_result = self.attack_with_regiment(
-                        selected_player.id,
-                        regiment.id,
-                        'regiment',
-                        defending_regiment.id,
-                    )
-                    result = action_result['result']
-                    attacker_losses = sum(result['casualties_a'].values())
-                    defender_losses = sum(result['casualties_b'].values())
+                    result = self.queue_action_for_player(selected_player.id, {
+                        'action_type': 'attack_regiment',
+                        'actor_id': regiment.id,
+                        'target_id': defending_regiment.id,
+                    })
                     print(
-                        f'{regiment.symbol()} attacked {defending_regiment.symbol()} from '
-                        f'{result["attack_distance"]} tile(s).'
+                        f'Planned attack: {regiment.symbol()} -> {defending_regiment.symbol()}. '
+                        f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                     )
-                    if result['defender_was_defending']:
-                        print(
-                            f'{defending_regiment.symbol()} was defending: '
-                            f'attack reduced to {result["defender_effective_attack_score"]} '
-                            f'while effective defense score {result["defender_defense_score"]} reduced incoming losses.'
-                        )
-                    print(
-                        f'Attacker losses: {attacker_losses} | Defender losses: {defender_losses} | '
-                        f'Remaining units: attacker={result["remaining_units_a"]}, defender={result["remaining_units_b"]}'
-                    )
-                    print(
-                        f'Movement remaining: {regiment.movement_remaining()} | '
-                        f'Attacks remaining this turn: {max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)}'
-                    )
-                    if result['defeated_a']:
-                        print(f'{regiment.name} was destroyed.')
-                    if result['defeated_b']:
-                        print(f'{defending_regiment.name} was destroyed.')
                 else:
                     target_city = target['entity']
                     city_type = 'Capital' if target_city.is_capital else 'City'
-                    action_result = self.attack_with_regiment(
-                        selected_player.id,
-                        regiment.id,
-                        'city',
-                        target_city.id,
-                    )
-                    result = action_result['result']
+                    result = self.queue_action_for_player(selected_player.id, {
+                        'action_type': 'attack_city',
+                        'actor_id': regiment.id,
+                        'target_id': target_city.id,
+                    })
                     print(
-                        f'{regiment.symbol()} attacked {city_type} {target_city.id} ({target_city.name}) from '
-                        f'{result["attack_distance"]} tile(s).'
+                        f'Planned attack: {regiment.symbol()} -> {city_type} {target_city.id} ({target_city.name}). '
+                        f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                     )
-                    print(
-                        f'Siege resistance: {result["resistance_before"]} -> '
-                        f'{result["resistance_after"]} / {result["max_resistance"]}'
-                    )
-                    print(
-                        'Cities now fire automatically during round advancement; siege attacks do not trigger '
-                        'extra retaliation.'
-                    )
-                    print(
-                        f'Movement remaining: {regiment.movement_remaining()} | '
-                        f'Attacks remaining this turn: {max(0, regiment.max_attacks_per_turn() - regiment.attacks_made_this_turn)}'
-                    )
-                    if result['sacked']:
-                        new_owner = self.map.get_player(result['new_owner_id'])
-                        new_owner_name = new_owner.name if new_owner is not None else f'Player {result["new_owner_id"]}'
-                        print(
-                            f'{city_type} {target_city.name} was captured by {new_owner_name}. '
-                            f'Full city influence returns in {result["occupation_recovery_turns_remaining"]} turn(s). '
-                            f'Siege repairs wait {result["siege_repair_delay_turns_remaining"]} turn(s), and regiment production '
-                            f'is locked for {result["regiment_production_lock_turns_remaining"]} turn(s).'
-                        )
             except ValueError as error:
                 print(error)
 
@@ -3991,7 +4841,7 @@ class Game:
                 print('No empire is currently selected.')
                 return
 
-            regiment_input = input('Enter regiment id or exact name to split: ').strip()
+            regiment_input = input('Enter regiment/navy id or exact name to split: ').strip()
             try:
                 regiment = _resolve_owned_regiment(regiment_input, selected_player.id)
                 split_counts = _build_split_counts(regiment)
@@ -4029,8 +4879,8 @@ class Game:
                 print('No empire is currently selected.')
                 return
 
-            source_input = input('Enter regiment id or exact name to combine from: ').strip()
-            target_input = input('Enter regiment id or exact name to combine into: ').strip()
+            source_input = input('Enter regiment/navy id or exact name to combine from: ').strip()
+            target_input = input('Enter regiment/navy id or exact name to combine into: ').strip()
             try:
                 source_regiment = _resolve_owned_regiment(source_input, selected_player.id)
                 target_regiment = _resolve_owned_regiment(target_input, selected_player.id)
@@ -4060,7 +4910,7 @@ class Game:
 
             try:
                 regiment = _resolve_owned_regiment(
-                    input('Enter regiment id or exact name to move: ').strip(),
+                    input('Enter regiment/navy id or exact name to move: ').strip(),
                     selected_player.id,
                 )
             except ValueError as error:
@@ -4070,18 +4920,34 @@ class Game:
             def move_regiment_absolute():
                 try:
                     target_x, target_y = _parse_tile_coordinates(input('Enter target tile as x y: '))
-                    self.move_regiment_for_player(selected_player.id, regiment.id, target_x, target_y)
-                    print(f'Moved {regiment.symbol()} to ({target_x}, {target_y}).')
+                    result = self.queue_action_for_player(selected_player.id, {
+                        'action_type': 'move_regiment',
+                        'actor_id': regiment.id,
+                        'target_pos': (target_x, target_y),
+                    })
+                    print(
+                        f'Planned move for {regiment.symbol()} to ({target_x}, {target_y}). '
+                        f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                    )
                 except ValueError as error:
                     print(error)
 
             def move_regiment_delta():
                 try:
                     delta_x, delta_y = _parse_delta_coordinates(input('Enter movement delta as dx dy: '))
-                    result = self.move_regiment_for_player_by_delta(selected_player.id, regiment.id, delta_x, delta_y)
+                    location = self.map.get_regiment_location(regiment.id)
+                    if location is None:
+                        raise ValueError(f'Regiment {regiment.id} is not on the map.')
+                    target_pos = (location[0] + delta_x, location[1] + delta_y)
+                    result = self.queue_action_for_player(selected_player.id, {
+                        'action_type': 'move_regiment',
+                        'actor_id': regiment.id,
+                        'target_pos': target_pos,
+                    })
                     print(
-                        f'Moved {regiment.symbol()} by ({delta_x}, {delta_y}) to '
-                        f'({result["target_pos"][0]}, {result["target_pos"][1]}).'
+                        f'Planned move for {regiment.symbol()} by ({delta_x}, {delta_y}) to '
+                        f'({target_pos[0]}, {target_pos[1]}). '
+                        f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                     )
                 except ValueError as error:
                     print(error)
@@ -4141,20 +5007,27 @@ class Game:
                 return
             self.print_player_hand(selected_player.id)
 
+        def print_planned_actions():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            self.print_player_planned_actions(selected_player.id)
+
         def _prompt_for_card_target_payload(selected_player: Player, card: Card):
             payload = {}
             target_scope = card.definition.target_scope
 
             if target_scope == 'own_regiment':
                 regiment = _resolve_owned_regiment(
-                    input('Enter friendly regiment id or exact name to target: ').strip(),
+                    input('Enter friendly regiment/navy id or exact name to target: ').strip(),
                     selected_player.id,
                 )
                 payload['target_kind'] = 'regiment'
                 payload['target_id'] = regiment.id
             elif target_scope == 'enemy_regiment':
                 target = _resolve_attack_target(
-                    input('Enter enemy regiment target (R# or exact name): ').strip(),
+                    input('Enter enemy regiment/navy target (R#, N#, or exact name): ').strip(),
                     selected_player.id,
                 )
                 if target['kind'] != 'regiment':
@@ -4249,6 +5122,15 @@ class Game:
             if not selected_player.hand:
                 print('There are no cards in your hand.')
                 return
+            if self.get_player_planned_action_count(selected_player.id) >= self.get_player_action_limit(selected_player.id):
+                print(f'{selected_player.name} has already planned the maximum actions for this turn.')
+                return
+            if self.get_player_planned_card_count(selected_player.id) >= min(
+                self.get_player_action_limit(selected_player.id),
+                self.get_player_card_limit(selected_player.id),
+            ):
+                print(f'{selected_player.name} has already planned the maximum card plays for this turn.')
+                return
 
             self.print_player_hand(selected_player.id)
             hand_selection = input('Enter the hand slot number to play: ').strip()
@@ -4264,10 +5146,19 @@ class Game:
             card = selected_player.hand[hand_index]
             try:
                 payload = _prompt_for_card_target_payload(selected_player, card)
-                result = self.play_card_for_player(selected_player.id, hand_index, payload)
-                print(f'Played {result["card"].definition.name}.')
-                for message in result['messages']:
-                    print(f'  {message}')
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'play_card',
+                    'metadata': {
+                        'card_instance_id': card.instance_id,
+                        'card_name': card.definition.name,
+                        'target_payload': payload,
+                    },
+                })
+                print(
+                    f'Planned card: {card.definition.name}. '
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]} | '
+                    f'cards planned: {result["card_count"]}/{result["card_limit"]}.'
+                )
             except ValueError as error:
                 print(error)
 
@@ -4305,10 +5196,11 @@ class Game:
             player_menu.add_option('Print Players', self.map.print_player_metadata, 'p')
             player_menu.add_option('Print Cities/Capitals', print_visible_city_metadata, 'c')
             player_menu.add_option('View Cards', print_cards_in_hand, 'h')
+            player_menu.add_option('View Planned Actions', print_planned_actions, 'l')
             player_menu.add_option('Play Card', play_card_action, 'y')
             player_menu.add_option('Discard Card', discard_card_action, 'd')
             player_menu.add_option('Build Regiment', create_regiment_order, 'r')
-            player_menu.add_option('View Regiment Build Queue', print_regiment_build_queue_status, 'b')
+            player_menu.add_option('View Force Build Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
             player_menu.add_option('Combine/Split Regiment', combine_or_split_regiment, 's')
             player_menu.add_option('Regiment Attack/Defend', regiment_attack_or_defend, 'a')
@@ -4324,7 +5216,15 @@ class Game:
                 if selected_player is not None:
                     print(f'Empire: {selected_player.name} (Player {selected_player.id})')
                     if current_player is not None:
-                        print(f'Active empire: {current_player.name} (Player {current_player.id})')
+                        print(f'Planning empire: {current_player.name} (Player {current_player.id})')
+                    action_limit = self.get_player_action_limit(selected_player.id)
+                    card_limit = min(action_limit, self.get_player_card_limit(selected_player.id))
+                    influence_score = self.map.get_player_total_influence_score(selected_player.id)
+                    print(
+                        f'Influence={influence_score:.2f} | '
+                        f'planned actions={self.get_player_planned_action_count(selected_player.id)}/{action_limit} | '
+                        f'planned cards={self.get_player_planned_card_count(selected_player.id)}/{card_limit}'
+                    )
                     if selected_player.deck is not None:
                         print(
                             f'Cards: hand={len(selected_player.hand)}/{selected_player.hand_limit()} | '

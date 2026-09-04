@@ -11,6 +11,12 @@ colorama_init(autoreset=True)
 class Player:
 
     MAX_HAND_SIZE = 5
+    INITIAL_MATERIALS = {
+        'coin': 180,
+        'food': 90,
+        'wood': 70,
+        'stone': 30,
+    }
 
     def __init__(self, id: int, name: str, color: str, controller_type: str = 'human'):
         self.id = id
@@ -21,12 +27,62 @@ class Player:
         self.hand = []
         self.active_card_effects = []
         self.card_play_lock_sources = 0
+        self.materials = self._build_initial_materials()
 
     def initialize_cards(self, deck):
         self.deck = deck
         self.hand = []
         self.active_card_effects = []
         self.card_play_lock_sources = 0
+
+    def _build_initial_materials(self):
+        return {
+            material: int(amount)
+            for material, amount in self.INITIAL_MATERIALS.items()
+        }
+
+    def reset_materials(self):
+        self.materials = self._build_initial_materials()
+
+    def get_material(self, material_type: str):
+        normalized_material = str(material_type).strip().lower()
+        return int(self.materials.get(normalized_material, 0))
+
+    def add_materials(self, delta: dict[str, int]):
+        for material_type, amount in delta.items():
+            normalized_material = str(material_type).strip().lower()
+            self.materials[normalized_material] = max(
+                0,
+                self.get_material(normalized_material) + int(amount),
+            )
+
+    def can_afford(self, costs: dict[str, int]):
+        return all(
+            self.get_material(material_type) >= max(0, int(amount))
+            for material_type, amount in costs.items()
+        )
+
+    def spend_materials(self, costs: dict[str, int]):
+        normalized_costs = {
+            str(material_type).strip().lower(): max(0, int(amount))
+            for material_type, amount in costs.items()
+            if int(amount) > 0
+        }
+        if not self.can_afford(normalized_costs):
+            shortfalls = [
+                f'{material_type}={amount - self.get_material(material_type)}'
+                for material_type, amount in normalized_costs.items()
+                if self.get_material(material_type) < amount
+            ]
+            raise ValueError(f'Cannot afford costs: {", ".join(shortfalls)}')
+        for material_type, amount in normalized_costs.items():
+            self.materials[material_type] = self.get_material(material_type) - amount
+
+    def materials_summary(self):
+        return ', '.join(
+            f'{material_type.title()}={self.get_material(material_type)}'
+            for material_type in ('coin', 'food', 'wood', 'stone')
+        )
 
     def can_draw_card(self):
         return len(self.hand) < self.MAX_HAND_SIZE
@@ -59,16 +115,29 @@ class City:
     SIEGE_REGEN_RATE = 0.15
     SACK_POPULATION_PENALTY = 0.30
     POST_CAPTURE_RESISTANCE_RATIO = 0.25
-    
+    MIN_LEVEL = 1
+    MAX_LEVEL = 10
+    LEVEL_XP_BASE = 140
+    LEVEL_XP_GROWTH = 1.85
+    LEVEL_DEFENSE_SCALING = 0.08
+    LEVEL_INFLUENCE_SCALING = 0.04
+    SOVEREIGNTY_XP_PER_TURN = 8
+
     def __init__(self, id: int, name: str, owner_id: int,
                  population: int = 1000, is_capital: bool = False,
                  defense_score: float = None, attack_score: float = None,
-                 line_of_sight_radius: int = None):
+                 line_of_sight_radius: int = None, level: int = 1,
+                 experience: int = 0):
         self.id = id
         self.name = name
         self.owner_id = owner_id
         self.population = population
         self.is_capital = is_capital
+        self.level = self._validate_level(level)
+        self.experience = max(
+            self.experience_required_for_level(self.level),
+            int(experience),
+        )
         self.defense_score = defense_score if defense_score is not None else self._default_defense_score()
         self.attack_score = attack_score if attack_score is not None else self._default_attack_score()
         self.line_of_sight_radius = self._validate_line_of_sight_radius(
@@ -87,32 +156,147 @@ class City:
         self.siege_repair_delay_turns_remaining = 0
         self.regiment_production_lock_turns_remaining = 0
         self.previous_owner_id = None
+        self.queue_slot_bonus = 0
+        self.production_speed_bonus = 0.0
+        self.regiment_power_bonus = 0.0
+        self.hero_access_bonus = 0
+        self.resource_pull_bonus = 0.0
+        self.navy_access_bonus = 0
+        self.coin_income_bonus = 0.0
+        self.food_income_bonus = 0.0
+        self.wood_income_bonus = 0.0
+        self.stone_income_bonus = 0.0
+        self.food_growth_bonus = 0.0
+        self.siege_resistance_bonus = 0.0
+        self.pending_capture_level_penalty = False
         self._update_symbol()
+        self.refresh_derived_stats(preserve_siege_ratio=False)
 
     def mark_as_capital(self):
         self.is_capital = True
-        self.defense_score = self._default_defense_score()
-        self.attack_score = self._default_attack_score()
         self.influence_profile_anchors = self._default_influence_anchors()
-        self.max_siege_resistance = self._default_max_siege_resistance()
-        self.siege_resistance = self.max_siege_resistance
+        self.refresh_derived_stats(preserve_siege_ratio=False)
         self._update_symbol()
 
     def _default_defense_score(self):
         # Population and capital status provide a simple defensive baseline.
-        return round(28 + (self.population / 160) + (14 if self.is_capital else 0), 2)
+        base_defense = 28 + (self.population / 160) + (14 if self.is_capital else 0)
+        return round(base_defense * (1 + ((self.level - 1) * self.LEVEL_DEFENSE_SCALING)), 2)
 
     def _default_attack_score(self):
         scale = self.CAPITAL_ATTACK_SCALE if self.is_capital else self.DEFAULT_ATTACK_SCALE
         return round(self._default_defense_score() * scale, 2)
 
     def _default_max_siege_resistance(self):
-        return round(self.defense_score * self.RESISTANCE_MULTIPLIER, 2)
+        return round(
+            (self.defense_score * self.RESISTANCE_MULTIPLIER) + getattr(self, 'siege_resistance_bonus', 0.0),
+            2,
+        )
 
     def _validate_line_of_sight_radius(self, radius: int):
         if not isinstance(radius, int) or radius < 0:
             raise ValueError('City line of sight radius must be a non-negative integer')
         return radius
+
+    def _validate_level(self, level: int):
+        if not isinstance(level, int):
+            raise ValueError('City level must be an integer')
+        if level < self.MIN_LEVEL or level > self.MAX_LEVEL:
+            raise ValueError(f'City level must be between {self.MIN_LEVEL} and {self.MAX_LEVEL}')
+        return level
+
+    @classmethod
+    def experience_required_for_level(cls, level: int):
+        validated_level = max(cls.MIN_LEVEL, min(cls.MAX_LEVEL, int(level)))
+        if validated_level <= cls.MIN_LEVEL:
+            return 0
+        required = 0
+        for level_index in range(2, validated_level + 1):
+            required += int(round(cls.LEVEL_XP_BASE * (cls.LEVEL_XP_GROWTH ** (level_index - 2))))
+        return required
+
+    def _determine_level_from_experience(self):
+        resolved_level = self.MIN_LEVEL
+        for candidate_level in range(self.MIN_LEVEL, self.MAX_LEVEL + 1):
+            if self.experience >= self.experience_required_for_level(candidate_level):
+                resolved_level = candidate_level
+            else:
+                break
+        return resolved_level
+
+    def refresh_derived_stats(self, preserve_siege_ratio: bool = True):
+        existing_ratio = 1.0
+        if preserve_siege_ratio and getattr(self, 'max_siege_resistance', 0) > 0:
+            existing_ratio = self.siege_resistance / self.max_siege_resistance
+        self.defense_score = self._default_defense_score()
+        self.attack_score = self._default_attack_score()
+        self.max_siege_resistance = self._default_max_siege_resistance()
+        if preserve_siege_ratio:
+            self.siege_resistance = round(
+                max(0.0, min(self.max_siege_resistance, self.max_siege_resistance * existing_ratio)),
+                2,
+            )
+        else:
+            self.siege_resistance = self.max_siege_resistance
+
+    def add_experience(self, amount: int):
+        experience_gain = max(0, int(amount))
+        if experience_gain <= 0:
+            return {'experience_gained': 0, 'level_before': self.level, 'level_after': self.level}
+        level_before = self.level
+        self.experience += experience_gain
+        self.level = self._determine_level_from_experience()
+        if self.level != level_before:
+            self.refresh_derived_stats()
+        return {
+            'experience_gained': experience_gain,
+            'level_before': level_before,
+            'level_after': self.level,
+        }
+
+    def set_level(self, level: int, reset_experience_to_floor: bool = True):
+        resolved_level = self._validate_level(level)
+        level_before = self.level
+        self.level = resolved_level
+        if reset_experience_to_floor or self.experience < self.experience_required_for_level(resolved_level):
+            self.experience = self.experience_required_for_level(resolved_level)
+        if self.level != level_before:
+            self.refresh_derived_stats()
+
+    def level_bonus_radius(self):
+        return (self.level - 1) // 3
+
+    def level_bonus_queue_slots(self):
+        return 1 if self.level >= 4 else 0
+
+    def level_bonus_attack_radius(self):
+        return 1 if self.level >= 7 else 0
+
+    def queue_capacity(self):
+        return max(1, 1 + self.level_bonus_queue_slots() + self.queue_slot_bonus + (1 if self.level >= 8 else 0))
+
+    def production_turn_multiplier(self):
+        return max(0.45, 1.0 - self.production_speed_bonus - (0.03 * max(0, self.level - 1)))
+
+    def can_train_heroes(self):
+        return self.level >= 5 or self.hero_access_bonus > 0
+
+    def has_navy_access(self):
+        return self.navy_access_bonus > 0
+
+    def apply_population_growth(self, amount: int):
+        growth = max(0, int(amount))
+        if growth <= 0:
+            return {'population_before': self.population, 'population_after': self.population, 'growth': 0}
+        population_before = self.population
+        self.population += growth
+        self.refresh_derived_stats()
+        self.add_experience(max(1, growth // 6))
+        return {
+            'population_before': population_before,
+            'population_after': self.population,
+            'growth': growth,
+        }
 
     def _default_influence_anchors(self):
         return dict(
@@ -124,6 +308,7 @@ class City:
             0,
             self.line_of_sight_radius +
             self.influence_radius_bonus +
+            self.level_bonus_radius() +
             (self.CAPITAL_LINE_OF_SIGHT_BONUS if self.is_capital else 0),
         )
         occupation_multiplier = self.occupation_influence_multiplier()
@@ -134,7 +319,12 @@ class City:
         return max(1, math.ceil(full_radius * occupation_multiplier))
 
     def effective_attack_radius(self):
-        return max(1, self.DEFAULT_ATTACK_RADIUS + (self.CAPITAL_ATTACK_RADIUS_BONUS if self.is_capital else 0))
+        return max(
+            1,
+            self.DEFAULT_ATTACK_RADIUS +
+            self.level_bonus_attack_radius() +
+            (self.CAPITAL_ATTACK_RADIUS_BONUS if self.is_capital else 0),
+        )
 
     def occupation_stabilization_turns(self):
         return (
@@ -176,6 +366,7 @@ class City:
         modified_score = (
             (base_score + self.influence_score_bonus) *
             self.influence_score_multiplier *
+            (1.0 + (self.LEVEL_INFLUENCE_SCALING * max(0, self.level - 1))) *
             self.occupation_influence_multiplier()
         )
         return max(0.0, min(1.0, round(modified_score, 4)))
@@ -202,10 +393,11 @@ class City:
         self.population = max(1, round(self.population * (1 - self.SACK_POPULATION_PENALTY)))
         self.occupation_recovery_total_turns = self.occupation_stabilization_turns()
         self.occupation_recovery_turns_remaining = self.occupation_recovery_total_turns
-        self.max_siege_resistance = self._default_max_siege_resistance()
+        self.refresh_derived_stats(preserve_siege_ratio=False)
         self.siege_resistance = round(self.max_siege_resistance * self.POST_CAPTURE_RESISTANCE_RATIO, 2)
         self.siege_repair_delay_turns_remaining = self.occupation_stabilization_turns()
         self.regiment_production_lock_turns_remaining = self.occupation_stabilization_turns()
+        self.pending_capture_level_penalty = True
         self._update_symbol()
 
     def update_post_capture_cooldowns(self, total_influence_score: float, max_influence_score: float):
@@ -217,7 +409,16 @@ class City:
     def can_queue_regiment(self):
         return self.regiment_production_lock_turns_remaining <= 0
 
+    def grant_sovereignty_experience(self, under_enemy_pressure: bool = False):
+        if self.occupation_recovery_turns_remaining > 0:
+            return {'experience_gained': 0, 'level_before': self.level, 'level_after': self.level}
+        if under_enemy_pressure:
+            return {'experience_gained': 0, 'level_before': self.level, 'level_after': self.level}
+        return self.add_experience(self.SOVEREIGNTY_XP_PER_TURN + max(0, self.level - 1))
+
     def progress_turn_state(self, under_enemy_pressure: bool = False):
+        level_penalty_applied = False
+        level_before_penalty = self.level
         if not under_enemy_pressure:
             if self.occupation_recovery_turns_remaining > 0:
                 self.occupation_recovery_turns_remaining -= 1
@@ -233,6 +434,10 @@ class City:
                 )
             if self.regiment_production_lock_turns_remaining > 0:
                 self.regiment_production_lock_turns_remaining -= 1
+            if self.pending_capture_level_penalty and self.occupation_recovery_turns_remaining <= 0:
+                self.set_level(max(self.MIN_LEVEL, self.level - 2))
+                self.pending_capture_level_penalty = False
+                level_penalty_applied = True
         return {
             'city_id': self.id,
             'under_enemy_pressure': under_enemy_pressure,
@@ -240,6 +445,10 @@ class City:
             'occupation_recovery_turns_remaining': self.occupation_recovery_turns_remaining,
             'siege_repair_delay_turns_remaining': self.siege_repair_delay_turns_remaining,
             'regiment_production_lock_turns_remaining': self.regiment_production_lock_turns_remaining,
+            'level': self.level,
+            'experience': self.experience,
+            'capture_level_penalty_applied': level_penalty_applied,
+            'level_before_penalty': level_before_penalty,
         }
 
     @staticmethod
@@ -305,7 +514,7 @@ class Tile:
 
     def __init__(self, type: str = 'grass', x: int = None, y: int = None,
                  regiment_id: int = None, city_id: int = None,
-                 resource_id: int = None):
+                 resource_id: int = None, improvement_id: int = None):
         if type not in Tile._allowable_types.keys():
             raise ValueError(f'Invalid tile type: {type}')
         self.type = type
@@ -314,12 +523,257 @@ class Tile:
         self.regiment_id = regiment_id
         self.city_id = city_id
         self.resource_id = resource_id
+        self.improvement_id = improvement_id
         self.passable_foot = self._allowable_types[type]['passable_foot']
         self.passable_water = self._allowable_types[type]['passable_water']
         self.symbol = self._allowable_types[type]['symbol']
         self.influence_scores: dict[int, float] = {}
         self.influence_owner_id: int | None = None
         self.is_influence_contested = False
+
+class ResourceDefinition:
+
+    def __init__(self, resource_type: str, name: str, symbol: str,
+                 terrain_types: set[str], material_bonus: dict[str, int] = None,
+                 city_bonuses: dict[str, float] = None):
+        self.resource_type = str(resource_type).strip().lower()
+        self.name = str(name).strip()
+        self.symbol = str(symbol).strip()
+        self.terrain_types = set(terrain_types)
+        self.material_bonus = dict(material_bonus) if material_bonus is not None else {}
+        self.city_bonuses = dict(city_bonuses) if city_bonuses is not None else {}
+
+class Resource:
+
+    DEFINITIONS: dict[str, ResourceDefinition] = {}
+    SPAWN_TABLE = {
+        'grass': (
+            (0.10, 'wheat'),
+            (0.17, 'horses'),
+            (0.20, 'gems'),
+        ),
+        'hill': (
+            (0.08, 'wheat'),
+            (0.16, 'horses'),
+            (0.25, 'iron'),
+            (0.32, 'stone_vein'),
+        ),
+        'forest': (
+            (0.18, 'timber'),
+            (0.22, 'gems'),
+        ),
+        'mountain': (
+            (0.16, 'iron'),
+            (0.25, 'stone_vein'),
+            (0.30, 'gems'),
+        ),
+        'water': (
+            (0.16, 'fish'),
+            (0.22, 'pearls'),
+        ),
+    }
+
+    @classmethod
+    def initialize_definitions(cls):
+        if cls.DEFINITIONS:
+            return
+        definitions = [
+            ResourceDefinition('wheat', 'Wheat', 'Wh', {'grass', 'hill'}, {'food': 3}, {'resource_pull_bonus': 0.08}),
+            ResourceDefinition('horses', 'Horses', 'Ho', {'grass', 'hill'}, {'food': 1}, {'regiment_power_bonus': 0.06}),
+            ResourceDefinition('timber', 'Timber', 'Ti', {'forest'}, {'wood': 3}, {'resource_pull_bonus': 0.06}),
+            ResourceDefinition('iron', 'Iron', 'Ir', {'hill', 'mountain'}, {'stone': 1}, {'regiment_power_bonus': 0.08}),
+            ResourceDefinition('stone_vein', 'Stone Vein', 'St', {'hill', 'mountain'}, {'stone': 2}, {'defense_bonus': 4}),
+            ResourceDefinition('fish', 'Fish', 'Fi', {'water'}, {'food': 2}, {'food_growth_bonus': 0.05}),
+            ResourceDefinition('pearls', 'Pearls', 'Pe', {'water'}, {'coin': 3}, {'card_purchase_tier_bonus': 1}),
+            ResourceDefinition('gems', 'Gems', 'Ge', {'grass', 'hill', 'mountain', 'forest'}, {'coin': 4}, {'card_purchase_tier_bonus': 1}),
+        ]
+        cls.DEFINITIONS = {
+            definition.resource_type: definition
+            for definition in definitions
+        }
+
+    @classmethod
+    def choose_for_tile(cls, tile_type: str, rng):
+        cls.initialize_definitions()
+        entries = cls.SPAWN_TABLE.get(tile_type, ())
+        if not entries:
+            return None
+        roll = rng.random()
+        for threshold, resource_type in entries:
+            if roll <= threshold:
+                return resource_type
+        return None
+
+    def __init__(self, resource_type: str, id: int = None):
+        Resource.initialize_definitions()
+        normalized_resource_type = str(resource_type).strip().lower()
+        if normalized_resource_type not in self.DEFINITIONS:
+            raise ValueError(f'Unsupported resource type: {resource_type}')
+        self.id = id
+        self.resource_type = normalized_resource_type
+        self.definition = self.DEFINITIONS[normalized_resource_type]
+        self.name = self.definition.name
+        self.symbol = self.definition.symbol
+
+class ImprovementDefinition:
+
+    def __init__(self, improvement_kind: str, name: str, symbol: str,
+                 intra_city: bool, build_turns: int, costs: dict[str, int],
+                 min_city_level: int = 1, required_tile_types: set[str] = None,
+                 requires_adjacent_water: bool = False, bonuses: dict[str, float] = None,
+                 city_xp_reward: int = 0, max_per_city: int | None = None):
+        self.improvement_kind = str(improvement_kind).strip().lower()
+        self.name = str(name).strip()
+        self.symbol = str(symbol).strip()
+        self.intra_city = bool(intra_city)
+        self.build_turns = max(1, int(build_turns))
+        self.costs = {
+            str(material_type).strip().lower(): max(0, int(amount))
+            for material_type, amount in costs.items()
+        }
+        self.min_city_level = max(1, int(min_city_level))
+        self.required_tile_types = set(required_tile_types) if required_tile_types is not None else set()
+        self.requires_adjacent_water = bool(requires_adjacent_water)
+        self.bonuses = dict(bonuses) if bonuses is not None else {}
+        self.city_xp_reward = max(0, int(city_xp_reward))
+        self.max_per_city = None if max_per_city is None else max(1, int(max_per_city))
+
+class Improvement:
+
+    DEFINITIONS: dict[str, ImprovementDefinition] = {}
+
+    @classmethod
+    def initialize_definitions(cls):
+        if cls.DEFINITIONS:
+            return
+        definitions = [
+            ImprovementDefinition(
+                'granary', 'Granary', 'Gr', True, 2, {'coin': 35, 'wood': 10},
+                min_city_level=1,
+                bonuses={'food_growth_bonus': 0.18, 'resource_pull_bonus': 0.08, 'food_income_bonus': 0.10},
+                city_xp_reward=55, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'market', 'Market', 'Mk', True, 3, {'coin': 50, 'wood': 15},
+                min_city_level=2,
+                bonuses={'coin_income_bonus': 0.20, 'influence_multiplier_bonus': 0.05},
+                city_xp_reward=70, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'barracks', 'Barracks', 'Ba', True, 3, {'coin': 60, 'wood': 20, 'stone': 10},
+                min_city_level=2,
+                bonuses={'production_speed_bonus': 0.15, 'regiment_power_bonus': 0.12, 'hero_access_bonus': 1},
+                city_xp_reward=85, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'walls', 'Walls', 'Wa', True, 4, {'coin': 70, 'stone': 24},
+                min_city_level=4,
+                bonuses={'defense_bonus': 18, 'siege_resistance_bonus': 80},
+                city_xp_reward=95, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'castle', 'Castle', 'Ca', True, 5, {'coin': 110, 'wood': 25, 'stone': 40},
+                min_city_level=6,
+                bonuses={
+                    'defense_bonus': 28,
+                    'attack_bonus': 15,
+                    'queue_slot_bonus': 1,
+                    'production_speed_bonus': 0.10,
+                    'hero_access_bonus': 1,
+                    'coin_income_bonus': 0.10,
+                },
+                city_xp_reward=135, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'watchtower', 'Watchtower', 'Wt', False, 2, {'coin': 30, 'wood': 16},
+                min_city_level=2, required_tile_types={'grass', 'hill', 'forest'},
+                bonuses={'influence_radius_bonus': 1, 'influence_multiplier_bonus': 0.03},
+                city_xp_reward=45, max_per_city=1,
+            ),
+            ImprovementDefinition(
+                'farm', 'Farm', 'Fa', False, 2, {'coin': 25, 'wood': 10},
+                min_city_level=1, required_tile_types={'grass', 'hill'},
+                bonuses={'food_income_flat': 4, 'resource_pull_bonus': 0.10},
+                city_xp_reward=45, max_per_city=None,
+            ),
+            ImprovementDefinition(
+                'lumber_mill', 'Lumber Mill', 'Lu', False, 2, {'coin': 25, 'wood': 8},
+                min_city_level=1, required_tile_types={'forest'},
+                bonuses={'wood_income_flat': 4},
+                city_xp_reward=45, max_per_city=None,
+            ),
+            ImprovementDefinition(
+                'quarry', 'Quarry', 'Qu', False, 3, {'coin': 40, 'wood': 10},
+                min_city_level=3, required_tile_types={'hill', 'mountain'},
+                bonuses={'stone_income_flat': 4},
+                city_xp_reward=65, max_per_city=None,
+            ),
+            ImprovementDefinition(
+                'port', 'Port', 'Po', False, 3, {'coin': 55, 'wood': 28},
+                min_city_level=2, required_tile_types={'grass', 'hill', 'forest'},
+                requires_adjacent_water=True,
+                bonuses={'navy_access_bonus': 1, 'production_speed_bonus': 0.05, 'hero_access_bonus': 1},
+                city_xp_reward=75, max_per_city=1,
+            ),
+        ]
+        cls.DEFINITIONS = {
+            definition.improvement_kind: definition
+            for definition in definitions
+        }
+
+    def __init__(self, improvement_kind: str, city_id: int, owner_id: int,
+                 id: int = None, tile_pos: tuple[int, int] = None):
+        Improvement.initialize_definitions()
+        normalized_kind = str(improvement_kind).strip().lower()
+        if normalized_kind not in self.DEFINITIONS:
+            raise ValueError(f'Unsupported improvement kind: {improvement_kind}')
+        self.id = id
+        self.improvement_kind = normalized_kind
+        self.definition = self.DEFINITIONS[normalized_kind]
+        self.city_id = city_id
+        self.owner_id = owner_id
+        self.tile_pos = tuple(tile_pos) if tile_pos is not None else None
+        self.name = self.definition.name
+        self.symbol = self.definition.symbol
+        self.is_destroyed = False
+
+    def is_intra_city(self):
+        return self.definition.intra_city
+
+    def is_extra_city(self):
+        return not self.definition.intra_city
+
+    def is_port(self):
+        return self.improvement_kind == 'port'
+
+    def apply_to_city(self, city: City, reverse: bool = False):
+        direction = -1 if reverse else 1
+        for bonus_name, value in self.definition.bonuses.items():
+            scaled_value = value * direction
+            if bonus_name == 'influence_multiplier_bonus':
+                city.influence_score_multiplier = max(
+                    0.0,
+                    round(city.influence_score_multiplier + scaled_value, 4),
+                )
+                continue
+            if bonus_name == 'defense_bonus':
+                city.defense_score_bonus += scaled_value
+                continue
+            if bonus_name == 'attack_bonus':
+                city.attack_score_bonus += scaled_value
+                continue
+            if bonus_name == 'siege_resistance_bonus':
+                city.siege_resistance_bonus += scaled_value
+                city.refresh_derived_stats()
+                continue
+            if hasattr(city, bonus_name):
+                current_value = getattr(city, bonus_name)
+                updated_value = current_value + scaled_value
+                if isinstance(current_value, int):
+                    updated_value = int(round(updated_value))
+                elif isinstance(current_value, float):
+                    updated_value = round(updated_value, 4)
+                setattr(city, bonus_name, updated_value)
 
 class Card:
 
@@ -692,6 +1146,12 @@ class Regiment:
     DEFENDING_ATTACK_MULTIPLIER = 0.75
     DEFENDING_DEFENSE_MULTIPLIER = 1.25
     DEFENSE_SCORE_SCALE = 100.0
+    MIN_LEVEL = 1
+    MAX_LEVEL = 10
+    LEVEL_XP_BASE = 55
+    LEVEL_XP_GROWTH = 1.90
+    LEVEL_SCORE_SCALING = 0.07
+    LEVEL_INFLUENCE_SCALING = 0.05
 
     CITY_ATTACK_WEIGHTS = {
         'infantry': 0.8,
@@ -705,10 +1165,16 @@ class Regiment:
     def __init__(self, id: int = None, name: str = 'Unnamed Regiment', owner_id: int = None,
                  infantry: int = 0, ranged: int = 0, cavalry: int = 0,
                  siege: int = 0, navy: int = 0, heroes: list[str] = None,
-                 line_of_sight_radius: int = None):
+                 line_of_sight_radius: int = None, level: int = 1,
+                 experience: int = 0):
         self.id = id
         self.name = name
         self.owner_id = owner_id
+        self.level = self._validate_level(level)
+        self.experience = max(
+            self.experience_required_for_level(self.level),
+            int(experience),
+        )
         self.infantry = self._validate_unit_count(infantry, 'infantry')
         self.ranged = self._validate_unit_count(ranged, 'ranged')
         self.cavalry = self._validate_unit_count(cavalry, 'cavalry')
@@ -754,6 +1220,66 @@ class Regiment:
             raise ValueError('Regiment line of sight radius must be a non-negative integer')
         return radius
 
+    def _validate_level(self, level: int):
+        if not isinstance(level, int):
+            raise ValueError('Regiment level must be an integer')
+        if level < self.MIN_LEVEL or level > self.MAX_LEVEL:
+            raise ValueError(f'Regiment level must be between {self.MIN_LEVEL} and {self.MAX_LEVEL}')
+        return level
+
+    @classmethod
+    def experience_required_for_level(cls, level: int):
+        validated_level = max(cls.MIN_LEVEL, min(cls.MAX_LEVEL, int(level)))
+        if validated_level <= cls.MIN_LEVEL:
+            return 0
+        required = 0
+        for level_index in range(2, validated_level + 1):
+            required += int(round(cls.LEVEL_XP_BASE * (cls.LEVEL_XP_GROWTH ** (level_index - 2))))
+        return required
+
+    def _determine_level_from_experience(self):
+        resolved_level = self.MIN_LEVEL
+        for candidate_level in range(self.MIN_LEVEL, self.MAX_LEVEL + 1):
+            if self.experience >= self.experience_required_for_level(candidate_level):
+                resolved_level = candidate_level
+            else:
+                break
+        return resolved_level
+
+    def add_experience(self, amount: int):
+        experience_gain = max(0, int(amount))
+        if experience_gain <= 0:
+            return {'experience_gained': 0, 'level_before': self.level, 'level_after': self.level}
+        level_before = self.level
+        self.experience += experience_gain
+        self.level = self._determine_level_from_experience()
+        if self.level != level_before:
+            self.recalculate_attack_scores()
+        return {
+            'experience_gained': experience_gain,
+            'level_before': level_before,
+            'level_after': self.level,
+        }
+
+    def set_level(self, level: int, reset_experience_to_floor: bool = True):
+        resolved_level = self._validate_level(level)
+        level_before = self.level
+        self.level = resolved_level
+        if reset_experience_to_floor or self.experience < self.experience_required_for_level(resolved_level):
+            self.experience = self.experience_required_for_level(resolved_level)
+        if self.level != level_before:
+            self.recalculate_attack_scores()
+
+    def effective_influence_multiplier(self):
+        return max(
+            0.0,
+            round(
+                self.influence_score_multiplier *
+                (1.0 + (self.LEVEL_INFLUENCE_SCALING * max(0, self.level - 1))),
+                4,
+            ),
+        )
+
     def total_units(self):
         return self.infantry + self.ranged + self.cavalry + self.siege + self.navy
 
@@ -771,7 +1297,7 @@ class Regiment:
             raise ValueError('Navy forces may only contain navy units and heroes')
 
     def effective_line_of_sight_radius(self):
-        return max(0, self.line_of_sight_radius + self.influence_radius_bonus)
+        return max(0, self.line_of_sight_radius + self.influence_radius_bonus + ((self.level - 1) // 4))
 
     def has_hero_influence(self):
         return self.hero_count() > 0 and self.hero_influence_bonus > 0
@@ -895,7 +1421,10 @@ class Regiment:
         return self.ranged > 0 or getattr(self, 'navy', 0) > 0
 
     def attack_range(self):
-        return self.RANGED_ATTACK_RADIUS if self.has_ranged_attack_capability() else 1
+        base_attack_range = self.RANGED_ATTACK_RADIUS if self.has_ranged_attack_capability() else 1
+        if self.level >= 7 and (self.has_ranged_attack_capability() or self.siege > 0):
+            return base_attack_range + 1
+        return base_attack_range
 
     def can_attack_distance(self, distance: int):
         return 0 <= distance <= self.attack_range()
@@ -934,7 +1463,8 @@ class Regiment:
             return 0.0
 
         hero_bonus = 1 + (0.05 * self.hero_count())
-        return round((total_weighted_units / total_units) * hero_bonus * 100, 2)
+        level_bonus = 1 + (self.LEVEL_SCORE_SCALING * max(0, self.level - 1))
+        return round((total_weighted_units / total_units) * hero_bonus * level_bonus * 100, 2)
 
 class Map:
 
@@ -953,8 +1483,12 @@ class Map:
         self.players: dict[int, Player] = {}
         self.cities: dict[int, City] = {}
         self.regiments: dict[int, Regiment] = {}
+        self.resources: dict[int, Resource] = {}
+        self.improvements: dict[int, Improvement] = {}
         self.player_discovered_tiles: dict[int, set[tuple[int, int]]] = {}
         self.next_regiment_id = 1
+        self.next_resource_id = 1
+        self.next_improvement_id = 1
         self.resolved_regiment_battles_this_turn: set[tuple[int, int]] = set()
         self.resolved_sieges_this_turn: set[int] = set()
         self.resolved_city_attacks_this_turn: set[int] = set()
@@ -1028,6 +1562,132 @@ class Map:
 
     def get_regiment(self, regiment_id: int):
         return self.regiments.get(regiment_id)
+
+    def get_resource(self, resource_id: int):
+        return self.resources.get(resource_id)
+
+    def get_resource_at(self, x: int, y: int):
+        tile = self.tiles.get((x, y))
+        if tile is None or tile.resource_id is None:
+            return None
+        return self.get_resource(tile.resource_id)
+
+    def add_resource(self, resource: Resource, x: int, y: int):
+        if (x, y) not in self.tiles:
+            raise ValueError(f'Resource tile ({x}, {y}) is out of bounds')
+        tile = self.tiles[(x, y)]
+        if tile.resource_id is not None:
+            raise ValueError(f'Tile ({x}, {y}) already has a resource')
+        if resource.definition.terrain_types and tile.type not in resource.definition.terrain_types:
+            raise ValueError(f'Resource {resource.name} cannot be placed on {tile.type}')
+        if resource.id is None:
+            resource.id = self.next_resource_id
+            self.next_resource_id += 1
+        self.resources[resource.id] = resource
+        tile.resource_id = resource.id
+        return resource
+
+    def get_improvement(self, improvement_id: int):
+        return self.improvements.get(improvement_id)
+
+    def get_improvement_at(self, x: int, y: int):
+        tile = self.tiles.get((x, y))
+        if tile is None or tile.improvement_id is None:
+            return None
+        return self.get_improvement(tile.improvement_id)
+
+    def get_city_improvements(self, city_id: int, include_destroyed: bool = False):
+        return [
+            improvement for improvement in self.improvements.values()
+            if improvement.city_id == city_id and (include_destroyed or not improvement.is_destroyed)
+        ]
+
+    def get_city_ports(self, city_id: int):
+        return [
+            improvement for improvement in self.get_city_improvements(city_id)
+            if improvement.is_port()
+        ]
+
+    def add_improvement(self, improvement: Improvement):
+        if improvement.city_id not in self.cities:
+            raise ValueError(f'Improvement references missing city {improvement.city_id}')
+        city = self.cities[improvement.city_id]
+        if improvement.owner_id != city.owner_id:
+            improvement.owner_id = city.owner_id
+        if improvement.id is None:
+            improvement.id = self.next_improvement_id
+            self.next_improvement_id += 1
+        if improvement.is_extra_city():
+            if improvement.tile_pos is None:
+                raise ValueError('Extra-city improvements require a tile position')
+            if improvement.tile_pos not in self.tiles:
+                raise ValueError(f'Improvement tile {improvement.tile_pos} is out of bounds')
+            tile = self.tiles[improvement.tile_pos]
+            if tile.improvement_id is not None:
+                raise ValueError(f'Tile {improvement.tile_pos} already has an improvement')
+            tile.improvement_id = improvement.id
+        self.improvements[improvement.id] = improvement
+        improvement.apply_to_city(city, reverse=False)
+        self.recalculate_tile_influence()
+        self.update_player_discovery(city.owner_id)
+        return improvement
+
+    def remove_improvement(self, improvement_id: int):
+        improvement = self.improvements.get(improvement_id)
+        if improvement is None:
+            return None
+        city = self.cities.get(improvement.city_id)
+        if city is not None:
+            improvement.apply_to_city(city, reverse=True)
+        if improvement.tile_pos is not None and improvement.tile_pos in self.tiles:
+            self.tiles[improvement.tile_pos].improvement_id = None
+        improvement.is_destroyed = True
+        self.improvements.pop(improvement_id, None)
+        self.recalculate_tile_influence()
+        if city is not None and city.owner_id in self.players:
+            self.update_player_discovery(city.owner_id)
+        return improvement
+
+    def transfer_city_improvements_to_owner(self, city_id: int, new_owner_id: int):
+        for improvement in self.get_city_improvements(city_id):
+            improvement.owner_id = new_owner_id
+
+    def city_has_resource_in_sight(self, city_id: int, resource_type: str):
+        return any(
+            resource.resource_type == str(resource_type).strip().lower()
+            for resource in self.get_city_visible_resources(city_id)
+        )
+
+    def get_city_visible_resources(self, city_id: int):
+        city = self.get_city(city_id)
+        city_location = self.get_city_location(city_id)
+        if city is None or city_location is None:
+            return []
+        resources = []
+        for resource in self.resources.values():
+            resource_location = self.get_resource_location(resource.id)
+            if resource_location is None:
+                continue
+            if self.get_tile_distance(city_location, resource_location) <= city.effective_line_of_sight_radius():
+                resources.append(resource)
+        return resources
+
+    def get_resource_location(self, resource_id: int):
+        for (x, y), tile in self.tiles.items():
+            if tile.resource_id == resource_id:
+                return (x, y)
+        return None
+
+    def populate_resources(self):
+        Resource.initialize_definitions()
+        seeded_rng = random.Random((self.width * 4099) + (self.height * 8191) + (len(self.cities) * 131))
+        for position, tile in sorted(self.tiles.items()):
+            if tile.resource_id is not None:
+                continue
+            resource_type = Resource.choose_for_tile(tile.type, seeded_rng)
+            if resource_type is None:
+                continue
+            self.add_resource(Resource(resource_type), position[0], position[1])
 
     def get_regiment_location(self, regiment_id: int):
         for (x, y), tile in self.tiles.items():
@@ -1124,6 +1784,29 @@ class Map:
                 tiles_in_radius.add((x, y))
         return tiles_in_radius
 
+    def is_tile_securely_owned_by_player(self, x: int, y: int, player_id: int):
+        tile = self.tiles.get((x, y))
+        if tile is None:
+            return False
+        return tile.influence_owner_id == player_id and not tile.is_influence_contested
+
+    def is_tile_in_city_line_of_sight(self, city_id: int, x: int, y: int):
+        city_location = self.get_city_location(city_id)
+        city = self.get_city(city_id)
+        if city is None or city_location is None:
+            return False
+        return self.get_tile_distance(city_location, (x, y)) <= city.effective_line_of_sight_radius()
+
+    def is_adjacent_to_water(self, x: int, y: int):
+        for delta_x in (-1, 0, 1):
+            for delta_y in (-1, 0, 1):
+                if delta_x == 0 and delta_y == 0:
+                    continue
+                neighbor = self.tiles.get((x + delta_x, y + delta_y))
+                if neighbor is not None and neighbor.passable_water:
+                    return True
+        return False
+
     def _clamp_influence_score(self, score: float):
         return round(max(0.0, min(self.MAX_INFLUENCE_SCORE, float(score))), 4)
 
@@ -1200,7 +1883,7 @@ class Map:
                 if city_influence_by_tile[position].get(regiment.owner_id, 0.0) > self.INFLUENCE_EPSILON:
                     regiment_support_by_tile[position][regiment.owner_id] = self._clamp_influence_score(
                         regiment_support_by_tile[position][regiment.owner_id] +
-                        (regiment.city_influence_support_bonus * regiment.influence_score_multiplier)
+                        (regiment.city_influence_support_bonus * regiment.effective_influence_multiplier())
                     )
 
                 for player_id in self.players:
@@ -1210,19 +1893,19 @@ class Map:
                         continue
                     regiment_disruption_by_tile[position][player_id] = self._clamp_influence_score(
                         regiment_disruption_by_tile[position][player_id] +
-                        (regiment.city_influence_disruption_penalty * regiment.influence_score_multiplier)
+                        (regiment.city_influence_disruption_penalty * regiment.effective_influence_multiplier())
                     )
 
             if regiment.has_hero_influence():
                 for position in self.get_tiles_in_radius(regiment_location, regiment.hero_influence_radius):
                     hero_influence_by_tile[position][regiment.owner_id] = self._clamp_influence_score(
                         hero_influence_by_tile[position][regiment.owner_id] +
-                        (regiment.hero_influence_bonus * regiment.influence_score_multiplier)
+                        (regiment.hero_influence_bonus * regiment.effective_influence_multiplier())
                     )
 
             regiment_tile_control_by_tile[regiment_location][regiment.owner_id] = self._clamp_influence_score(
                 regiment_tile_control_by_tile[regiment_location][regiment.owner_id] +
-                (regiment.tile_influence_score * regiment.influence_score_multiplier)
+                (regiment.tile_influence_score * regiment.effective_influence_multiplier())
             )
 
         for position, tile in self.tiles.items():
@@ -1290,7 +1973,8 @@ class Map:
 
     def can_place_regiment_on_tile(self, regiment: Regiment, tile: Tile):
         if regiment.is_navy():
-            return tile.passable_water
+            improvement = self.get_improvement(tile.improvement_id) if tile.improvement_id is not None else None
+            return tile.passable_water or (improvement is not None and improvement.is_port())
         return tile.passable_foot or (regiment.terrain_boundary_pass_enabled and not tile.passable_water)
 
     def add_regiment(self, regiment: Regiment, x: int, y: int):
@@ -1352,6 +2036,9 @@ class Map:
         if regiment.is_defending:
             regiment.is_defending = False
         regiment.record_movement(distance)
+        improvement = self.get_improvement(target_tile.improvement_id) if target_tile.improvement_id is not None else None
+        if improvement is not None and improvement.owner_id != regiment.owner_id:
+            self.remove_improvement(improvement.id)
         if (
             regiment.terrain_boundary_pass_enabled and
             not regiment.is_navy() and
@@ -1423,6 +2110,8 @@ class Map:
             cavalry=transfer_counts['cavalry'],
             siege=transfer_counts['siege'],
             navy=transfer_counts['navy'],
+            level=regiment.level,
+            experience=regiment.experience,
         )
         self.add_regiment(split_regiment, target_x, target_y)
         regiment.update_composition(
@@ -1432,6 +2121,14 @@ class Map:
             siege=remaining_counts['siege'],
             navy=remaining_counts['navy'],
         )
+        original_size = regiment.total_units()
+        split_size = split_regiment.total_units()
+        if split_size > original_size:
+            split_regiment.set_level(regiment.level)
+            regiment.set_level(max(Regiment.MIN_LEVEL, regiment.level // 2))
+        else:
+            regiment.set_level(regiment.level)
+            split_regiment.set_level(max(Regiment.MIN_LEVEL, regiment.level // 2))
         regiment.mark_reorganized_this_turn()
         split_regiment.mark_reorganized_this_turn()
         self.recalculate_tile_influence()
@@ -1473,6 +2170,13 @@ class Map:
         if self.get_tile_distance(source_location, target_location) != 1:
             raise ValueError('Regiments must be on adjacent tiles to combine')
 
+        source_size = source_regiment.total_units()
+        target_size = target_regiment.total_units()
+        highest_level = max(source_regiment.level, target_regiment.level)
+        preserve_highest_level = (
+            (source_regiment.level > target_regiment.level and source_size > target_size) or
+            (target_regiment.level > source_regiment.level and target_size > source_size)
+        )
         target_regiment.update_composition(
             infantry=target_regiment.infantry + source_regiment.infantry,
             ranged=target_regiment.ranged + source_regiment.ranged,
@@ -1481,11 +2185,29 @@ class Map:
             navy=target_regiment.navy + source_regiment.navy,
         )
         target_regiment.heroes.extend(source_regiment.heroes)
+        if preserve_highest_level:
+            target_regiment.set_level(highest_level)
+        else:
+            weighted_level = math.floor(
+                ((source_regiment.level * source_size) + (target_regiment.level * target_size)) /
+                max(1, source_size + target_size)
+            )
+            target_regiment.set_level(max(Regiment.MIN_LEVEL, weighted_level))
         target_regiment.recalculate_attack_scores()
         self._remove_regiment_from_map(source_regiment_id)
         target_regiment.mark_reorganized_this_turn()
         self.recalculate_tile_influence()
         return target_regiment
+
+    def _award_regiment_combat_experience(self, regiment: Regiment, casualties_inflicted: int,
+                                          casualties_taken: int = 0, defeated_enemy: bool = False,
+                                          attacked_city: bool = False):
+        experience_gain = max(0, int(casualties_inflicted * (6 if attacked_city else 4)))
+        experience_gain += max(0, int(casualties_taken))
+        if defeated_enemy:
+            experience_gain += 18 if attacked_city else 12
+        regiment.add_experience(experience_gain)
+        return experience_gain
 
     def resolve_regiment_battle(self, regiment_a_id: int, regiment_b_id: int) -> dict:
         regiment_a = self.get_regiment(regiment_a_id)
@@ -1547,6 +2269,19 @@ class Map:
             self._remove_regiment_from_map(regiment_a_id)
         if defeated_b:
             self._remove_regiment_from_map(regiment_b_id)
+
+        self._award_regiment_combat_experience(
+            regiment_a,
+            casualties_inflicted=sum(casualties_b.values()),
+            casualties_taken=sum(casualties_a.values()),
+            defeated_enemy=defeated_b,
+        )
+        self._award_regiment_combat_experience(
+            regiment_b,
+            casualties_inflicted=sum(casualties_a.values()),
+            casualties_taken=sum(casualties_b.values()),
+            defeated_enemy=defeated_a,
+        )
 
         self.resolved_regiment_battles_this_turn.add(battle_key)
         return {
@@ -1666,6 +2401,8 @@ class Map:
         if city.siege_resistance <= 0:
             previous_owner_id = city.owner_id
             city.begin_occupation(regiment.owner_id)
+            city.add_experience(20)
+            self.transfer_city_improvements_to_owner(city.id, city.owner_id)
             self.recalculate_tile_influence()
             city.update_post_capture_cooldowns(
                 total_influence_score=self.get_player_total_influence_score(city.owner_id),
@@ -1675,6 +2412,18 @@ class Map:
             if previous_owner_id in self.players:
                 self.update_player_discovery(previous_owner_id)
             sacked = True
+            self._award_regiment_combat_experience(
+                regiment,
+                casualties_inflicted=max(1, int(resistance_loss * 2)),
+                defeated_enemy=True,
+                attacked_city=True,
+            )
+        else:
+            self._award_regiment_combat_experience(
+                regiment,
+                casualties_inflicted=max(1, int(resistance_loss)),
+                attacked_city=True,
+            )
 
         self.resolved_sieges_this_turn.add(city_id)
         result = {
@@ -1745,6 +2494,8 @@ class Map:
         destroyed = regiment.total_units() == 0
         if destroyed:
             self._remove_regiment_from_map(regiment_id)
+
+        city.add_experience(max(4, casualty_count * 2))
 
         self.resolved_city_attacks_this_turn.add(city_id)
         return {
@@ -1872,7 +2623,11 @@ class Map:
             f'  id={regiment.id} | type={"Navy" if regiment.is_navy() else "Regiment"} | '
             f'name={regiment.name} | owner={owner_name} | location={location_text}'
         )
-        print(f'  composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, siege={regiment.siege}, navy={regiment.navy}, heroes={regiment.hero_count()}')
+        print(
+            f'  level={regiment.level} | xp={regiment.experience} | '
+            f'composition: infantry={regiment.infantry}, ranged={regiment.ranged}, cavalry={regiment.cavalry}, '
+            f'siege={regiment.siege}, navy={regiment.navy}, heroes={regiment.hero_count()}'
+        )
         print(
             f'  scores: vs_regiment={regiment.regiment_attack_score}, vs_regiment_effective={regiment.effective_regiment_attack_score()}, '
             f'defense={regiment.defense_score}, defense_effective={regiment.effective_defense_score()}, vs_city={regiment.effective_city_attack_score()} '
@@ -1975,10 +2730,16 @@ class Map:
 
         city = self.get_city(tile.city_id) if tile.city_id is not None else None
         regiment = self.get_regiment(tile.regiment_id) if tile.regiment_id is not None else None
+        improvement = self.get_improvement(tile.improvement_id) if tile.improvement_id is not None else None
+        resource = self.get_resource(tile.resource_id) if tile.resource_id is not None else None
         if regiment is not None:
             return regiment.symbol(), city, regiment
         if city is not None:
             return city.symbol, city, regiment
+        if improvement is not None:
+            return improvement.symbol, city, regiment
+        if resource is not None:
+            return resource.symbol, city, regiment
         return tile.symbol, city, regiment
 
     def print(self, viewer_player_id: int = None):
@@ -2030,6 +2791,8 @@ class Map:
             legend_entries.append(f'{s}={City._city_symbols[s]}')
         legend_entries.append('Regiment=R<id>(owner_id)')
         legend_entries.append('Navy=N<id>(owner_id)')
+        legend_entries.append('Improvement symbols=Gr/Mk/Ba/Wa/Ca/Wt/Fa/Lu/Qu/Po')
+        legend_entries.append('Resource symbols=Wh/Ho/Ti/Ir/St/Fi/Pe/Ge')
         legend_entries.append('Undiscovered=<space>')
         legend_entries.append('Influence tint: 0.0=white, 0.01+=40% player color, 1.0=full player color')
         print('-----\nLEGEND:')
@@ -2058,7 +2821,8 @@ class Map:
             prefix = f'{rank}. ' if show_rank else ''
             player_text = (
                 f'{prefix}P{player.id}: {player.name} ({player.color}) | '
-                f'controller={player.controller_type} | total influence={total_influence_score:.2f}'
+                f'controller={player.controller_type} | total influence={total_influence_score:.2f} | '
+                f'materials={player.materials_summary()}'
             )
             if color_code:
                 player_text = f'{color_code}{player_text}{Style.RESET_ALL}'
@@ -2092,10 +2856,16 @@ class Map:
             location_text = f'({location[0]}, {location[1]})' if location is not None else 'UNPLACED'
             print(
                 f'  {city_type} {city.id}: {city.name} | owner={owner_name} | '
-                f'population={city.population} | attack={city.effective_attack_score()} | '
+                f'level={city.level} xp={city.experience} | population={city.population} | attack={city.effective_attack_score()} | '
                 f'defense={city.effective_defense_score()} | siege={city.siege_resistance}/{city.max_siege_resistance} | '
-                f'line_of_sight={city.effective_line_of_sight_radius()} | location={location_text}'
+                f'line_of_sight={city.effective_line_of_sight_radius()} | queue={city.queue_capacity()} | location={location_text}'
             )
+            city_improvements = self.get_city_improvements(city.id)
+            if city_improvements:
+                print(f'    improvements: {", ".join(improvement.name for improvement in city_improvements)}')
+            city_resources = self.get_city_visible_resources(city.id)
+            if city_resources:
+                print(f'    resources in sight: {", ".join(resource.name for resource in city_resources)}')
             if city.occupation_recovery_turns_remaining > 0:
                 print(
                     f'    occupation recovery: {city.occupation_recovery_turns_remaining} turn(s) remaining | '
@@ -2208,6 +2978,7 @@ class MapLoader:
                     city_id=tile_city_attachments.get((x, y)),
                 )
 
+        game_map.populate_resources()
         game_map.refresh_all_player_discovery()
         return game_map
 
@@ -2306,14 +3077,30 @@ class SimpleAiController:
         if game.map is None or game.map.get_player(player_id) is None:
             return []
 
+        player = game.map.get_player(player_id)
         action_limit = game.get_player_action_limit(player_id)
         card_limit = min(action_limit, game.get_player_card_limit(player_id))
         actions = []
+        reserved_materials = dict(player.materials)
         reserved_regiment_targets = set()
         reserved_city_targets = set()
         actions.extend(self._plan_card_actions(game, player_id, action_limit, card_limit))
         if len(actions) < action_limit:
-            actions.extend(self._plan_regiment_orders(game, player_id, action_limit - len(actions)))
+            improvement_actions, reserved_materials = self._plan_improvement_orders(
+                game,
+                player_id,
+                action_limit - len(actions),
+                reserved_materials,
+            )
+            actions.extend(improvement_actions)
+        if len(actions) < action_limit:
+            force_actions, reserved_materials = self._plan_regiment_orders(
+                game,
+                player_id,
+                action_limit - len(actions),
+                reserved_materials,
+            )
+            actions.extend(force_actions)
 
         regiments = sorted(
             game.get_player_regiments(player_id),
@@ -2340,32 +3127,92 @@ class SimpleAiController:
                 reserved_city_targets.add(action['target_id'])
         return actions[:action_limit]
 
-    def _plan_regiment_orders(self, game, player_id: int, available_slots: int):
+    def _can_reserve_costs(self, budget: dict[str, int], costs: dict[str, int]):
+        return all(int(budget.get(material_type, 0)) >= int(amount) for material_type, amount in costs.items())
+
+    def _reserve_costs(self, budget: dict[str, int], costs: dict[str, int]):
+        updated_budget = dict(budget)
+        for material_type, amount in costs.items():
+            updated_budget[material_type] = int(updated_budget.get(material_type, 0)) - int(amount)
+        return updated_budget
+
+    def _plan_improvement_orders(self, game, player_id: int, available_slots: int, reserved_materials: dict[str, int]):
         if available_slots <= 0:
-            return []
+            return [], reserved_materials
+        owned_cities = sorted(
+            game.get_player_cities(player_id),
+            key=lambda city: (not city.is_capital, -city.level, -city.population, city.id),
+        )
+        actions = []
+        budget = dict(reserved_materials)
+        for city in owned_cities:
+            if len(actions) >= available_slots:
+                break
+            if game.get_city_queue_space_remaining(player_id, city.id) <= 0:
+                continue
+            candidate_improvements = []
+            if city.level >= 2 and not game.map.get_city_ports(city.id):
+                candidate_improvements.append('port')
+            if not any(improvement.improvement_kind == 'market' for improvement in game.map.get_city_improvements(city.id)):
+                candidate_improvements.append('market')
+            if not any(improvement.improvement_kind == 'barracks' for improvement in game.map.get_city_improvements(city.id)):
+                candidate_improvements.append('barracks')
+            candidate_improvements.extend(['farm', 'lumber_mill', 'quarry'])
+            for improvement_kind in candidate_improvements:
+                try:
+                    definition = game.get_improvement_definition(improvement_kind)
+                except ValueError:
+                    continue
+                if city.level < definition.min_city_level:
+                    continue
+                if not self._can_reserve_costs(budget, definition.costs):
+                    continue
+                valid_sites = game.find_valid_improvement_sites_for_city(city.id, definition.improvement_kind)
+                if not valid_sites:
+                    continue
+                target_pos = None if definition.intra_city else valid_sites[0]
+                actions.append({
+                    'action_type': 'queue_improvement',
+                    'player_id': player_id,
+                    'actor_id': city.id,
+                    'target_id': city.id,
+                    'metadata': {
+                        'improvement_kind': definition.improvement_kind,
+                        'improvement_name': definition.name,
+                        'target_pos': target_pos,
+                    },
+                })
+                budget = self._reserve_costs(budget, definition.costs)
+                break
+        return actions, budget
+
+    def _plan_regiment_orders(self, game, player_id: int, available_slots: int, reserved_materials: dict[str, int]):
+        if available_slots <= 0:
+            return [], reserved_materials
         owned_cities = sorted(
             game.get_player_cities(player_id),
             key=lambda city: (not city.is_capital, -city.population, city.id),
         )
         if not owned_cities:
-            return []
+            return [], reserved_materials
 
         owned_regiments = game.get_player_regiments(player_id)
         active_regiments = len([regiment for regiment in owned_regiments if not regiment.is_navy()])
         active_navies = len([regiment for regiment in owned_regiments if regiment.is_navy()])
         queued_regiments = sum(
             1 for order in game.regiment_build_queue
-            if order['owner_id'] == player_id and order.get('force_kind', 'regiment') == 'regiment'
+            if order['owner_id'] == player_id and order.get('order_kind', 'force') == 'force'
+            and order.get('force_kind', 'regiment') == 'regiment'
         )
         queued_navies = sum(
             1 for order in game.regiment_build_queue
-            if order['owner_id'] == player_id and order.get('force_kind', 'regiment') == 'navy'
+            if order['owner_id'] == player_id and order.get('order_kind', 'force') == 'force'
+            and order.get('force_kind', 'regiment') == 'navy'
         )
         desired_regiments = max(2, len(owned_cities) * 2)
-        owned_sea_tiles = game.get_player_owned_sea_tiles(player_id)
         influence_score = game.map.get_player_total_influence_score(player_id)
         desired_navies = 0
-        if owned_sea_tiles:
+        if any(game.map.get_city_ports(city.id) for city in owned_cities):
             desired_navies = 1
             if influence_score >= 30000:
                 desired_navies += 1
@@ -2381,6 +3228,7 @@ class SimpleAiController:
             threatened_cities = set()
 
         actions = []
+        budget = dict(reserved_materials)
         queued_this_turn = active_regiments + queued_regiments
         queued_navies_total = active_navies + queued_navies
         for city in owned_cities:
@@ -2388,11 +3236,14 @@ class SimpleAiController:
                 break
             if not city.can_queue_regiment():
                 continue
-            if game.has_regiment_order_for_city(city.id):
+            if game.get_city_queue_space_remaining(player_id, city.id) <= len([
+                action for action in actions if action['target_id'] == city.id
+            ]):
                 continue
             if queued_navies_total < desired_navies:
-                spawn_pos = self._find_best_navy_spawn_tile(game, player_id, city, owned_sea_tiles)
-                if spawn_pos is not None:
+                spawn_pos = self._find_best_navy_spawn_tile(game, player_id, city)
+                navy_cost = game.get_force_order_cost(city, 'navy')
+                if spawn_pos is not None and self._can_reserve_costs(budget, navy_cost):
                     navy_name = f'{city.name} Fleet T{game.turn}'
                     actions.append({
                         'action_type': 'queue_navy',
@@ -2406,10 +3257,14 @@ class SimpleAiController:
                             'priority': 110 if city.is_capital else 90,
                         },
                     })
+                    budget = self._reserve_costs(budget, navy_cost)
                     queued_navies_total += 1
                     continue
             should_queue = queued_this_turn < desired_regiments or city.id in threatened_cities
             if not should_queue:
+                continue
+            regiment_cost = game.get_force_order_cost(city, 'regiment')
+            if not self._can_reserve_costs(budget, regiment_cost):
                 continue
             regiment_name = f'{city.name} Guard T{game.turn}'
             actions.append({
@@ -2423,8 +3278,9 @@ class SimpleAiController:
                     'priority': 100 if city.is_capital else 80,
                 },
             })
+            budget = self._reserve_costs(budget, regiment_cost)
             queued_this_turn += 1
-        return actions
+        return actions, budget
 
     def _plan_card_actions(self, game, player_id: int, action_limit: int, card_limit: int):
         player = game.map.get_player(player_id)
@@ -2448,8 +3304,13 @@ class SimpleAiController:
                 actions.append(action)
         return actions
 
-    def _find_best_navy_spawn_tile(self, game, player_id: int, city: City, owned_sea_tiles: list[tuple[int, int]]):
-        if not owned_sea_tiles:
+    def _find_best_navy_spawn_tile(self, game, player_id: int, city: City):
+        port_positions = [
+            tuple(port.tile_pos)
+            for port in game.map.get_city_ports(city.id)
+            if port.tile_pos is not None
+        ]
+        if not port_positions:
             return None
         city_location = game.map.get_city_location(city.id)
         enemy_city_locations = [
@@ -2458,7 +3319,7 @@ class SimpleAiController:
             if game.map.get_city_location(enemy_city.id) is not None
         ]
         return min(
-            owned_sea_tiles,
+            port_positions,
             key=lambda position: (
                 0 if game.map.tiles[position].influence_owner_id == player_id else 1,
                 min(
@@ -2877,6 +3738,12 @@ class Game:
         self.round_planned_actions: dict[int, list[dict]] = {}
         self.last_round_summary = None
 
+    def initialize_player_economy(self):
+        if self.map is None:
+            raise ValueError('A map must be loaded before initializing player economy')
+        for player in self.map.players.values():
+            player.reset_materials()
+
     def get_selected_player(self):
         if self.map is None or self.selected_player_id is None:
             return None
@@ -2971,6 +3838,8 @@ class Game:
         if self.map is None:
             return None
         action_type = action['action_type']
+        if action_type in {'queue_regiment', 'queue_navy', 'queue_improvement', 'buy_card', 'recruit_hero', 'refit_force'}:
+            return action.get('player_id')
         if action_type == 'attack_regiment':
             target_regiment = self.map.get_regiment(action['target_id'])
             return None if target_regiment is None else target_regiment.owner_id
@@ -2999,8 +3868,16 @@ class Game:
             city_name = city.name if city is not None else f'City {action["target_id"]}'
             regiment_name = metadata.get('regiment_name', f'{city_name} Guard')
             if action_type == 'queue_navy':
-                return f'Queue navy "{regiment_name}" from {city_name} to {metadata.get("spawn_pos")}'
+                return f'Queue navy "{regiment_name}" from {city_name} at port {metadata.get("spawn_pos")}'
             return f'Queue regiment "{regiment_name}" at {city_name}'
+        if action_type == 'queue_improvement':
+            city = self.map.get_city(action['target_id']) if self.map is not None else None
+            city_name = city.name if city is not None else f'City {action["target_id"]}'
+            improvement_name = metadata.get('improvement_name', metadata.get('improvement_kind', 'Improvement'))
+            target_pos = metadata.get('target_pos')
+            if target_pos is None:
+                return f'Queue {improvement_name} in {city_name}'
+            return f'Queue {improvement_name} for {city_name} at {target_pos}'
         if action_type == 'move_regiment':
             return f'Move Regiment {action["actor_id"]} to {action["target_pos"]}'
         if action_type == 'attack_regiment':
@@ -3009,6 +3886,12 @@ class Game:
             return f'Regiment {action["actor_id"]} attack City {action["target_id"]}'
         if action_type == 'defend_regiment':
             return f'Regiment {action["actor_id"]} defend'
+        if action_type == 'buy_card':
+            return f'Buy {metadata.get("rarity", "common")} card'
+        if action_type == 'recruit_hero':
+            return f'Recruit hero for Regiment {action["target_id"]}'
+        if action_type == 'refit_force':
+            return f'Refit Regiment {action["target_id"]} with {metadata.get("upgrade_kind", "upgrade")}'
         if action_type == 'play_card':
             card_name = metadata.get('card_name', f'Card {metadata.get("card_instance_id")}')
             payload = metadata.get('target_payload', {})
@@ -3055,18 +3938,30 @@ class Game:
                     f'{city.name} cannot produce regiments for {city.regiment_production_lock_turns_remaining} more turn(s) '
                     f'while the occupation is being stabilized.'
                 )
-            if self.has_regiment_order_for_city(city.id):
-                raise ValueError(f'{city.name} already has a regiment in production.')
-            if any(
-                queued_action['action_type'] in {'queue_regiment', 'queue_navy'} and queued_action['target_id'] == city.id
-                for queued_action in self._ensure_round_plan_entry(player_id)
-            ):
-                raise ValueError(f'{city.name} already has a planned force order this turn.')
+            if self.get_city_queue_space_remaining(player_id, city.id) <= 0:
+                raise ValueError(f'{city.name} has no open production queue slots.')
             if action_type == 'queue_navy':
                 spawn_pos = metadata.get('spawn_pos')
                 if spawn_pos is None or len(spawn_pos) != 2:
-                    raise ValueError('Navy plans require a sea tile spawn position.')
-                self._validate_navy_spawn_tile(player_id, int(spawn_pos[0]), int(spawn_pos[1]))
+                    raise ValueError('Navy plans require a port tile spawn position.')
+                self._validate_navy_spawn_tile(player_id, city.id, int(spawn_pos[0]), int(spawn_pos[1]))
+            return action
+
+        if action_type == 'queue_improvement':
+            city_id = action['target_id']
+            if self.get_city_queue_space_remaining(player_id, city_id) <= 0:
+                city = self.map.get_city(city_id)
+                city_name = city.name if city is not None else f'City {city_id}'
+                raise ValueError(f'{city_name} has no open production queue slots.')
+            city, definition, normalized_target = self._validate_improvement_order(
+                player_id,
+                city_id,
+                metadata.get('improvement_kind'),
+                metadata.get('target_pos'),
+            )
+            metadata['improvement_kind'] = definition.improvement_kind
+            metadata['improvement_name'] = definition.name
+            metadata['target_pos'] = normalized_target
             return action
 
         if action_type == 'move_regiment':
@@ -3177,6 +4072,47 @@ class Game:
                 raise ValueError(f'Regiment {regiment.id} is already defending this turn.')
             return action
 
+        if action_type == 'buy_card':
+            player = self.map.get_player(player_id)
+            if player is None:
+                raise ValueError(f'Player {player_id} does not exist.')
+            if player.deck is None:
+                raise ValueError(f'Player {player_id} does not have a deck.')
+            if not player.can_draw_card():
+                raise ValueError(f'{player.name} cannot buy a card because the hand is full.')
+            rarity = str(metadata.get('rarity', 'common')).strip().lower()
+            if rarity not in self.get_available_card_purchase_rarities(player_id):
+                raise ValueError(f'{rarity.title()} cards are not yet available to your empire.')
+            metadata['rarity'] = rarity
+            return action
+
+        if action_type == 'recruit_hero':
+            regiment = self.map.get_regiment(action['target_id'])
+            if regiment is None:
+                raise ValueError(f'Regiment {action["target_id"]} does not exist.')
+            if regiment.owner_id != player_id:
+                raise ValueError(f'Regiment {regiment.id} belongs to another empire.')
+            host_city = self._resolve_regiment_supporting_city(regiment)
+            if host_city is None:
+                raise ValueError('Heroes may only be recruited into forces stationed in a friendly city or port.')
+            if not host_city.can_train_heroes():
+                raise ValueError(f'{host_city.name} does not yet have the training capacity to recruit heroes.')
+            return action
+
+        if action_type == 'refit_force':
+            regiment = self.map.get_regiment(action['target_id'])
+            if regiment is None:
+                raise ValueError(f'Regiment {action["target_id"]} does not exist.')
+            if regiment.owner_id != player_id:
+                raise ValueError(f'Regiment {regiment.id} belongs to another empire.')
+            if self._resolve_regiment_supporting_city(regiment) is None:
+                raise ValueError('Forces may only be refit inside a friendly city or port.')
+            upgrade_kind = str(metadata.get('upgrade_kind', '')).strip().lower()
+            if upgrade_kind not in {'ranged', 'siege'}:
+                raise ValueError('Refit plans require "ranged" or "siege".')
+            metadata['upgrade_kind'] = upgrade_kind
+            return action
+
         if action_type == 'play_card':
             if self.turn <= self.card_unlock_turn:
                 raise ValueError(f'Cards cannot be played until after turn {self.card_unlock_turn}.')
@@ -3257,6 +4193,28 @@ class Game:
             if city.owner_id == player_id
         ]
 
+    def get_production_orders_for_city(self, city_id: int):
+        return [
+            order for order in self.regiment_build_queue
+            if order['city_id'] == city_id
+        ]
+
+    def get_city_planned_production_count(self, player_id: int, city_id: int):
+        return sum(
+            1 for action in self._ensure_round_plan_entry(player_id)
+            if action['action_type'] in {'queue_regiment', 'queue_navy', 'queue_improvement'}
+            and action['target_id'] == city_id
+        )
+
+    def get_city_total_reserved_queue_slots(self, player_id: int, city_id: int):
+        return len(self.get_production_orders_for_city(city_id)) + self.get_city_planned_production_count(player_id, city_id)
+
+    def get_city_queue_space_remaining(self, player_id: int, city_id: int):
+        city = self.map.get_city(city_id) if self.map is not None else None
+        if city is None:
+            return 0
+        return max(0, city.queue_capacity() - self.get_city_total_reserved_queue_slots(player_id, city_id))
+
     def get_visible_enemy_regiments(self, player_id: int):
         if self.map is None:
             return []
@@ -3274,7 +4232,10 @@ class Game:
         ]
 
     def has_regiment_order_for_city(self, city_id: int):
-        return any(order['city_id'] == city_id for order in self.regiment_build_queue)
+        return any(
+            order['city_id'] == city_id and order.get('order_kind', 'force') == 'force'
+            for order in self.regiment_build_queue
+        )
 
     def has_regiment_order_for_city_this_turn(self, city_id: int):
         return any(
@@ -3290,6 +4251,181 @@ class Game:
             if tile.passable_water and tile.influence_owner_id == player_id and not tile.is_influence_contested
         ]
 
+    def get_player_owned_tile_count(self, player_id: int, tile_types: set[str] = None):
+        if self.map is None:
+            return 0
+        return sum(
+            1 for tile in self.map.tiles.values()
+            if tile.influence_owner_id == player_id and not tile.is_influence_contested
+            and (tile_types is None or tile.type in tile_types)
+        )
+
+    def get_player_accessible_resources(self, player_id: int):
+        if self.map is None:
+            return []
+        visible_resource_ids = set()
+        for city in self.get_player_cities(player_id):
+            for resource in self.map.get_city_visible_resources(city.id):
+                visible_resource_ids.add(resource.id)
+        return [
+            self.map.get_resource(resource_id)
+            for resource_id in sorted(visible_resource_ids)
+            if self.map.get_resource(resource_id) is not None
+        ]
+
+    def get_player_improvements(self, player_id: int):
+        if self.map is None:
+            return []
+        return [
+            improvement for improvement in self.map.improvements.values()
+            if improvement.owner_id == player_id
+        ]
+
+    def get_city_resource_bonus_summary(self, city: City):
+        bonuses = {
+            'resource_pull_bonus': city.resource_pull_bonus,
+            'regiment_power_bonus': city.regiment_power_bonus,
+            'defense_bonus': 0.0,
+            'food_growth_bonus': city.food_growth_bonus,
+            'card_purchase_tier_bonus': 0,
+        }
+        for resource in self.map.get_city_visible_resources(city.id):
+            for bonus_name, value in resource.definition.city_bonuses.items():
+                bonuses[bonus_name] = bonuses.get(bonus_name, 0) + value
+        return bonuses
+
+    def calculate_material_income(self, player_id: int):
+        if self.map is None:
+            return {'coin': 0, 'food': 0, 'wood': 0, 'stone': 0}
+        influence_score = self.map.get_player_total_influence_score(player_id)
+        influence_factor = max(1.0, influence_score / 10000)
+        forest_tiles = self.get_player_owned_tile_count(player_id, {'forest'})
+        food_tiles = self.get_player_owned_tile_count(player_id, {'grass', 'hill'})
+        coin_income = max(12, int(influence_score / 1400))
+        food_income = int(food_tiles * 0.55 * influence_factor)
+        wood_income = int(forest_tiles * 0.65 * influence_factor)
+        stone_income = 0
+
+        accessible_resources = self.get_player_accessible_resources(player_id)
+        for resource in accessible_resources:
+            for material_type, amount in resource.definition.material_bonus.items():
+                if material_type == 'coin':
+                    coin_income += amount
+                elif material_type == 'food':
+                    food_income += amount
+                elif material_type == 'wood':
+                    wood_income += amount
+                elif material_type == 'stone':
+                    stone_income += amount
+
+        for city in self.get_player_cities(player_id):
+            bonus_summary = self.get_city_resource_bonus_summary(city)
+            coin_income += int(round(coin_income * city.coin_income_bonus * 0.20))
+            food_income += int(round(max(0, bonus_summary.get('resource_pull_bonus', 0.0)) * 3))
+            food_income += int(round(food_tiles * city.food_income_bonus * 0.10))
+            wood_income += int(round(forest_tiles * city.wood_income_bonus * 0.10))
+            stone_income += int(round(max(0, city.stone_income_bonus) * 2))
+
+        for improvement in self.get_player_improvements(player_id):
+            bonuses = improvement.definition.bonuses
+            coin_income += int(bonuses.get('coin_income_flat', 0))
+            food_income += int(bonuses.get('food_income_flat', 0))
+            wood_income += int(bonuses.get('wood_income_flat', 0))
+            stone_income += int(bonuses.get('stone_income_flat', 0))
+
+        quarry_count = len([
+            improvement for improvement in self.get_player_improvements(player_id)
+            if improvement.improvement_kind == 'quarry'
+        ])
+        stone_income += int(quarry_count * max(1.0, influence_factor * 1.1))
+
+        return {
+            'coin': max(0, int(coin_income)),
+            'food': max(0, int(food_income)),
+            'wood': max(0, int(wood_income)),
+            'stone': max(0, int(stone_income)),
+        }
+
+    def process_material_income_for_new_round(self, viewer_player_id: int = None):
+        if self.map is None:
+            return []
+        messages = []
+        for player in sorted(self.map.players.values(), key=lambda entry: entry.id):
+            income = self.calculate_material_income(player.id)
+            player.add_materials(income)
+            if viewer_player_id in {None, player.id}:
+                messages.append(
+                    f'{player.name} gathered Coin={income["coin"]}, Food={income["food"]}, '
+                    f'Wood={income["wood"]}, Stone={income["stone"]}.'
+                )
+        return messages
+
+    def process_city_growth_and_sovereignty(self, viewer_player_id: int = None):
+        if self.map is None:
+            return []
+        messages = []
+        for player in sorted(self.map.players.values(), key=lambda entry: entry.id):
+            for city in sorted(self.get_player_cities(player.id), key=lambda entry: (-entry.level, -entry.population, entry.id)):
+                city_location = self.map.get_city_location(city.id)
+                under_enemy_pressure = bool(self.map.get_enemy_regiments_in_range_of_city(city.id))
+                city.grant_sovereignty_experience(under_enemy_pressure=under_enemy_pressure)
+                if city_location is None:
+                    continue
+                growth_food_cost = max(18, 12 + (city.level * 5) + (city.population // 350))
+                player_food = player.get_material('food')
+                if player_food < growth_food_cost:
+                    continue
+                bonus_summary = self.get_city_resource_bonus_summary(city)
+                growth_bonus = 1.0 + city.food_growth_bonus + bonus_summary.get('food_growth_bonus', 0.0)
+                growth_amount = max(
+                    10,
+                    int(round((12 + (city.level * 3) + (bonus_summary.get('resource_pull_bonus', 0.0) * 12)) * growth_bonus)),
+                )
+                player.spend_materials({'food': growth_food_cost})
+                growth_result = city.apply_population_growth(growth_amount)
+                if viewer_player_id in {None, player.id}:
+                    messages.append(
+                        f'{city.name} grew by {growth_result["growth"]} population for {growth_food_cost} Food '
+                        f'(population={growth_result["population_after"]}, level={city.level}).'
+                    )
+        return messages
+
+    def get_force_order_cost(self, city: City, force_kind: str):
+        normalized_force_kind = str(force_kind).strip().lower()
+        if normalized_force_kind == 'navy':
+            return {'coin': 55 + (city.level * 10)}
+        return {'coin': 35 + (city.level * 8)}
+
+    def get_card_purchase_cost(self, rarity: str):
+        return {
+            'common': {'coin': 35},
+            'uncommon': {'coin': 60},
+            'rare': {'coin': 95},
+            'legendary': {'coin': 150},
+        }[str(rarity).strip().lower()]
+
+    def get_card_purchase_tier(self, player_id: int):
+        tier = 0
+        accessible_resources = self.get_player_accessible_resources(player_id)
+        for resource in accessible_resources:
+            tier += int(resource.definition.city_bonuses.get('card_purchase_tier_bonus', 0))
+        if any(city.level >= 4 for city in self.get_player_cities(player_id)):
+            tier += 1
+        if any(improvement.improvement_kind in {'market', 'castle'} for improvement in self.get_player_improvements(player_id)):
+            tier += 1
+        return tier
+
+    def get_available_card_purchase_rarities(self, player_id: int):
+        tier = self.get_card_purchase_tier(player_id)
+        allowable = ['common']
+        if tier >= 1:
+            allowable.append('uncommon')
+        if tier >= 2:
+            allowable.append('rare')
+        if tier >= 4:
+            allowable.append('legendary')
+        return allowable
+
     def _deduplicate_messages(self, messages: list[str]):
         unique_messages = []
         seen_messages = set()
@@ -3301,20 +4437,28 @@ class Game:
         return unique_messages
 
     def _determine_regiment_build_turns(self, city: City):
-        return max(1, min(6, math.ceil(3000 / max(city.population, 1))))
+        base_turns = max(1, min(6, math.ceil(3000 / max(city.population, 1))))
+        return max(1, int(math.ceil(base_turns * city.production_turn_multiplier())))
 
     def _determine_navy_build_turns(self, city: City):
-        return max(2, min(8, self._determine_regiment_build_turns(city) + 2))
+        return max(2, min(8, self._determine_regiment_build_turns(city) + 1))
 
     def _create_random_regiment_for_city(self, city: City, owner_id: int, regiment_name: str):
-        total_units = max(8, city.population // 45 + self.random.randint(0, max(3, city.population // 200)))
+        resource_bonus = self.get_city_resource_bonus_summary(city)
+        size_multiplier = 1.0 + city.regiment_power_bonus + resource_bonus.get('regiment_power_bonus', 0.0)
+        total_units = int(round(
+            max(8, city.population // 45 + self.random.randint(0, max(3, city.population // 200))) *
+            size_multiplier
+        ))
         infantry = self.random.randint(total_units // 4, total_units // 2)
         remaining = total_units - infantry
         ranged = self.random.randint(0, remaining)
         remaining -= ranged
         cavalry = self.random.randint(0, remaining)
         siege = remaining - cavalry
-        heroes = [f'Hero_{self.random.randint(1, 999)}'] if self.random.random() < 0.35 else []
+        hero_chance = 0.0 if not city.can_train_heroes() else min(0.75, 0.08 + (0.07 * city.level) + (0.10 * city.hero_access_bonus))
+        heroes = [f'Hero_{self.random.randint(1, 999)}'] if self.random.random() < hero_chance else []
+        initial_level = min(Regiment.MAX_LEVEL, max(1, 1 + ((city.level - 1) // 3)))
         return Regiment(
             name=regiment_name,
             owner_id=owner_id,
@@ -3323,30 +4467,114 @@ class Game:
             cavalry=cavalry,
             siege=siege,
             heroes=heroes,
+            level=initial_level,
         )
 
     def _create_random_navy_for_city(self, city: City, owner_id: int, regiment_name: str):
-        total_units = max(4, city.population // 120 + self.random.randint(0, max(2, city.population // 450)))
-        heroes = [f'Admiral_{self.random.randint(1, 999)}'] if self.random.random() < 0.20 else []
+        resource_bonus = self.get_city_resource_bonus_summary(city)
+        size_multiplier = 1.0 + (city.regiment_power_bonus * 0.8) + (resource_bonus.get('regiment_power_bonus', 0.0) * 0.5)
+        total_units = int(round(
+            max(4, city.population // 120 + self.random.randint(0, max(2, city.population // 450))) *
+            size_multiplier
+        ))
+        hero_chance = 0.0 if not city.can_train_heroes() else min(0.60, 0.05 + (0.05 * city.level) + (0.08 * city.hero_access_bonus))
+        heroes = [f'Admiral_{self.random.randint(1, 999)}'] if self.random.random() < hero_chance else []
+        initial_level = min(Regiment.MAX_LEVEL, max(1, 1 + ((city.level - 1) // 3)))
         return Regiment(
             name=regiment_name,
             owner_id=owner_id,
             navy=total_units,
             heroes=heroes,
+            level=initial_level,
         )
 
-    def _validate_navy_spawn_tile(self, player_id: int, spawn_x: int, spawn_y: int):
+    def get_improvement_definition(self, improvement_kind: str):
+        Improvement.initialize_definitions()
+        normalized_kind = str(improvement_kind).strip().lower()
+        definition = Improvement.DEFINITIONS.get(normalized_kind)
+        if definition is None:
+            raise ValueError(f'Unsupported improvement kind: {improvement_kind}')
+        return definition
+
+    def _get_city_improvement_count(self, city_id: int, improvement_kind: str):
+        normalized_kind = str(improvement_kind).strip().lower()
+        return len([
+            improvement for improvement in self.map.get_city_improvements(city_id)
+            if improvement.improvement_kind == normalized_kind
+        ])
+
+    def find_valid_improvement_sites_for_city(self, city_id: int, improvement_kind: str):
+        if self.map is None:
+            return []
+        city = self.map.get_city(city_id)
+        city_location = self.map.get_city_location(city_id)
+        definition = self.get_improvement_definition(improvement_kind)
+        if city is None or city_location is None:
+            return []
+        if definition.intra_city:
+            if definition.max_per_city is not None and self._get_city_improvement_count(city.id, definition.improvement_kind) >= definition.max_per_city:
+                return []
+            return [city_location]
+        valid_positions = []
+        for position in sorted(self.map.get_tiles_in_radius(city_location, city.effective_line_of_sight_radius())):
+            tile = self.map.tiles.get(position)
+            if tile is None:
+                continue
+            if not self.map.is_tile_securely_owned_by_player(position[0], position[1], city.owner_id):
+                continue
+            if tile.improvement_id is not None:
+                continue
+            if definition.required_tile_types and tile.type not in definition.required_tile_types:
+                continue
+            if definition.requires_adjacent_water and not self.map.is_adjacent_to_water(position[0], position[1]):
+                continue
+            if definition.max_per_city is not None and self._get_city_improvement_count(city.id, definition.improvement_kind) >= definition.max_per_city:
+                continue
+            valid_positions.append(position)
+        return valid_positions
+
+    def _validate_improvement_order(self, player_id: int, city_id: int,
+                                    improvement_kind: str, target_pos: tuple[int, int] = None):
+        if self.map is None:
+            raise ValueError('A map must be loaded before queueing improvements.')
+        city = self.map.get_city(city_id)
+        if city is None:
+            raise ValueError(f'City {city_id} does not exist.')
+        if city.owner_id != player_id:
+            raise ValueError(f'City {city_id} belongs to another empire.')
+        definition = self.get_improvement_definition(improvement_kind)
+        if city.level < definition.min_city_level:
+            raise ValueError(f'{city.name} must be at least level {definition.min_city_level} to build {definition.name}.')
+        valid_positions = self.find_valid_improvement_sites_for_city(city.id, definition.improvement_kind)
+        if definition.intra_city:
+            if not valid_positions:
+                raise ValueError(f'{city.name} already has the maximum number of {definition.name} improvements.')
+            return city, definition, None
+        if target_pos is None:
+            raise ValueError(f'{definition.name} requires a target tile.')
+        normalized_target = (int(target_pos[0]), int(target_pos[1]))
+        if normalized_target not in valid_positions:
+            raise ValueError(f'Tile {normalized_target} is not a valid site for {definition.name}.')
+        return city, definition, normalized_target
+
+    def _validate_navy_spawn_tile(self, player_id: int, city_id: int, spawn_x: int, spawn_y: int):
         if self.map is None:
             raise ValueError('A map must be loaded before queueing navies.')
+        city = self.map.get_city(city_id)
+        if city is None:
+            raise ValueError(f'City {city_id} does not exist.')
         if (spawn_x, spawn_y) not in self.map.tiles:
-            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) is out of bounds.')
+            raise ValueError(f'Port tile ({spawn_x}, {spawn_y}) is out of bounds.')
         spawn_tile = self.map.tiles[(spawn_x, spawn_y)]
-        if not spawn_tile.passable_water:
-            raise ValueError(f'Tile ({spawn_x}, {spawn_y}) is not a sea tile.')
+        improvement = self.map.get_improvement(spawn_tile.improvement_id) if spawn_tile.improvement_id is not None else None
+        if improvement is None or not improvement.is_port():
+            raise ValueError(f'Tile ({spawn_x}, {spawn_y}) is not a port.')
+        if improvement.city_id != city_id:
+            raise ValueError(f'Port tile ({spawn_x}, {spawn_y}) does not belong to {city.name}.')
         if spawn_tile.regiment_id is not None:
-            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) already has a force on it.')
+            raise ValueError(f'Port tile ({spawn_x}, {spawn_y}) already has a force on it.')
         if spawn_tile.influence_owner_id != player_id or spawn_tile.is_influence_contested:
-            raise ValueError(f'Sea tile ({spawn_x}, {spawn_y}) is not securely owned by your empire.')
+            raise ValueError(f'Port tile ({spawn_x}, {spawn_y}) is not securely owned by your empire.')
         return spawn_tile
 
     def _queue_force_order(self, player_id: int, city_id: int, regiment_name: str = None,
@@ -3363,8 +4591,8 @@ class Game:
                 f'{city.name} cannot produce regiments for {city.regiment_production_lock_turns_remaining} more turn(s) '
                 f'while the occupation is being stabilized.'
             )
-        if self.has_regiment_order_for_city(city.id):
-            raise ValueError(f'{city.name} already has a regiment in production.')
+        if len(self.get_production_orders_for_city(city.id)) >= city.queue_capacity():
+            raise ValueError(f'{city.name} has no open production queue slots.')
 
         normalized_force_kind = str(force_kind).strip().lower()
         if normalized_force_kind not in {'regiment', 'navy'}:
@@ -3377,9 +4605,15 @@ class Game:
         spawn_position = None
         if normalized_force_kind == 'navy':
             if spawn_pos is None:
-                raise ValueError('A sea tile spawn position is required when queueing a navy.')
+                raise ValueError('A port tile spawn position is required when queueing a navy.')
             spawn_position = (int(spawn_pos[0]), int(spawn_pos[1]))
-            self._validate_navy_spawn_tile(player_id, spawn_position[0], spawn_position[1])
+            self._validate_navy_spawn_tile(player_id, city.id, spawn_position[0], spawn_position[1])
+
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist.')
+        costs = self.get_force_order_cost(city, normalized_force_kind)
+        player.spend_materials(costs)
 
         turns_to_build = (
             self._determine_navy_build_turns(city)
@@ -3387,6 +4621,7 @@ class Game:
             self._determine_regiment_build_turns(city)
         )
         self.regiment_build_queue.append({
+            'order_kind': 'force',
             'city_id': city.id,
             'owner_id': city.owner_id,
             'regiment_name': selected_name,
@@ -3394,6 +4629,7 @@ class Game:
             'spawn_pos': spawn_position,
             'turns_remaining': turns_to_build,
             'queued_on_turn': self.turn,
+            'costs': dict(costs),
         })
         return {
             'queued': True,
@@ -3403,6 +4639,7 @@ class Game:
             'force_kind': normalized_force_kind,
             'spawn_pos': spawn_position,
             'turns_to_build': turns_to_build,
+            'costs': dict(costs),
         }
 
     def queue_regiment_order(self, player_id: int, city_id: int, regiment_name: str = None):
@@ -3417,6 +4654,43 @@ class Game:
             spawn_pos=(spawn_x, spawn_y),
         )
 
+    def queue_improvement_order(self, player_id: int, city_id: int, improvement_kind: str,
+                                target_pos: tuple[int, int] = None):
+        city, definition, normalized_target = self._validate_improvement_order(
+            player_id,
+            city_id,
+            improvement_kind,
+            target_pos=target_pos,
+        )
+        if len(self.get_production_orders_for_city(city.id)) >= city.queue_capacity():
+            raise ValueError(f'{city.name} has no open production queue slots.')
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist.')
+        player.spend_materials(definition.costs)
+        turns_to_build = max(1, int(math.ceil(definition.build_turns * city.production_turn_multiplier())))
+        self.regiment_build_queue.append({
+            'order_kind': 'improvement',
+            'city_id': city.id,
+            'owner_id': city.owner_id,
+            'improvement_kind': definition.improvement_kind,
+            'improvement_name': definition.name,
+            'target_pos': normalized_target,
+            'turns_remaining': turns_to_build,
+            'queued_on_turn': self.turn,
+            'costs': dict(definition.costs),
+        })
+        return {
+            'queued': True,
+            'city_id': city.id,
+            'owner_id': city.owner_id,
+            'improvement_kind': definition.improvement_kind,
+            'improvement_name': definition.name,
+            'target_pos': normalized_target,
+            'turns_to_build': turns_to_build,
+            'costs': dict(definition.costs),
+        }
+
     def cancel_regiment_order(self, player_id: int, city_id: int):
         if self.map is None:
             raise ValueError('A map must be loaded before canceling regiment orders.')
@@ -3426,18 +4700,132 @@ class Game:
         if city.owner_id != player_id:
             raise ValueError(f'City {city_id} belongs to another empire.')
 
-        for order in self.regiment_build_queue:
+        for order in reversed(self.regiment_build_queue):
             if order['city_id'] != city_id:
                 continue
             self.regiment_build_queue.remove(order)
+            player = self.map.get_player(player_id)
+            if player is not None:
+                player.add_materials(order.get('costs', {}))
             return {
                 'canceled': True,
                 'city_id': city_id,
-                'regiment_name': order['regiment_name'],
+                'regiment_name': order.get('regiment_name'),
+                'improvement_name': order.get('improvement_name'),
                 'force_kind': order.get('force_kind', 'regiment'),
+                'order_kind': order.get('order_kind', 'force'),
                 'turns_remaining': order['turns_remaining'],
+                'refunded_costs': dict(order.get('costs', {})),
             }
-        raise ValueError(f'{city.name} has no regiment currently in production.')
+        raise ValueError(f'{city.name} has no production currently in progress.')
+
+    def purchase_card_for_player(self, player_id: int, rarity: str):
+        if self.map is None:
+            raise ValueError('A map must be loaded before purchasing cards.')
+        player = self.map.get_player(player_id)
+        if player is None:
+            raise ValueError(f'Player {player_id} does not exist.')
+        if player.deck is None:
+            raise ValueError(f'Player {player_id} does not have a deck.')
+        normalized_rarity = str(rarity).strip().lower()
+        if normalized_rarity not in self.get_available_card_purchase_rarities(player_id):
+            raise ValueError(f'{normalized_rarity.title()} cards are not yet available to your empire.')
+        if not player.can_draw_card():
+            raise ValueError(f'{player.name} cannot buy a card because the hand is full.')
+        costs = self.get_card_purchase_cost(normalized_rarity)
+        player.spend_materials(costs)
+        purchased_card = self.card_library.build_random_card_of_rarity(normalized_rarity, rng=self.random)
+        player.hand.append(purchased_card)
+        return {'purchased': True, 'card': purchased_card, 'rarity': normalized_rarity, 'costs': costs}
+
+    def _resolve_regiment_supporting_city(self, regiment: Regiment):
+        location = self.map.get_regiment_location(regiment.id) if self.map is not None else None
+        if location is None:
+            return None
+        tile = self.map.tiles.get(location)
+        if tile is None:
+            return None
+        if tile.city_id is not None:
+            city = self.map.get_city(tile.city_id)
+            if city is not None and city.owner_id == regiment.owner_id:
+                return city
+        if tile.improvement_id is not None:
+            improvement = self.map.get_improvement(tile.improvement_id)
+            if improvement is not None and improvement.owner_id == regiment.owner_id:
+                return self.map.get_city(improvement.city_id)
+        return None
+
+    def recruit_hero_for_player(self, player_id: int, regiment_id: int, hero_name: str = None):
+        if self.map is None:
+            raise ValueError('A map must be loaded before recruiting heroes.')
+        regiment = self.map.get_regiment(regiment_id)
+        if regiment is None:
+            raise ValueError(f'Regiment {regiment_id} does not exist.')
+        if regiment.owner_id != player_id:
+            raise ValueError(f'Regiment {regiment_id} belongs to another empire.')
+        host_city = self._resolve_regiment_supporting_city(regiment)
+        if host_city is None:
+            raise ValueError('Heroes may only be recruited into forces stationed in a friendly city or port.')
+        if not host_city.can_train_heroes():
+            raise ValueError(f'{host_city.name} does not yet have the training capacity to recruit heroes.')
+        player = self.map.get_player(player_id)
+        hero_cost = {'coin': 70 + (15 * regiment.hero_count())}
+        player.spend_materials(hero_cost)
+        resolved_name = str(hero_name).strip() if hero_name is not None else ''
+        regiment.add_hero(resolved_name or f'Hero_{self.random.randint(1000, 9999)}')
+        regiment.add_experience(18 + (host_city.level * 2))
+        return {
+            'recruited': True,
+            'regiment_id': regiment.id,
+            'hero_name': regiment.heroes[-1],
+            'city_id': host_city.id,
+            'costs': hero_cost,
+        }
+
+    def refit_force_for_player(self, player_id: int, regiment_id: int, upgrade_kind: str):
+        if self.map is None:
+            raise ValueError('A map must be loaded before refitting forces.')
+        regiment = self.map.get_regiment(regiment_id)
+        if regiment is None:
+            raise ValueError(f'Regiment {regiment_id} does not exist.')
+        if regiment.owner_id != player_id:
+            raise ValueError(f'Regiment {regiment_id} belongs to another empire.')
+        host_city = self._resolve_regiment_supporting_city(regiment)
+        if host_city is None:
+            raise ValueError('Forces may only be refit inside a friendly city or port.')
+        normalized_upgrade = str(upgrade_kind).strip().lower()
+        if normalized_upgrade not in {'ranged', 'siege'}:
+            raise ValueError('Upgrade type must be "ranged" or "siege".')
+        player = self.map.get_player(player_id)
+        if regiment.is_navy():
+            costs = {'wood': 16 if normalized_upgrade == 'ranged' else 20}
+            player.spend_materials(costs)
+            if normalized_upgrade == 'ranged':
+                regiment.attack_score_bonus += 10
+                regiment.defense_score_bonus += 5
+            else:
+                regiment.attack_score_bonus += 6
+                regiment.city_attack_score_bonus += 18
+            regiment.add_experience(10)
+            return {
+                'refit': True,
+                'regiment_id': regiment.id,
+                'upgrade_kind': normalized_upgrade,
+                'costs': costs,
+            }
+        costs = {'wood': 12 if normalized_upgrade == 'ranged' else 14}
+        player.spend_materials(costs)
+        if normalized_upgrade == 'ranged':
+            regiment.update_composition(ranged=regiment.ranged + 3)
+        else:
+            regiment.update_composition(siege=regiment.siege + 2)
+        regiment.add_experience(8)
+        return {
+            'refit': True,
+            'regiment_id': regiment.id,
+            'upgrade_kind': normalized_upgrade,
+            'costs': costs,
+        }
 
     def move_regiment_for_player(self, player_id: int, regiment_id: int, target_x: int, target_y: int):
         if self.map is None:
@@ -3539,6 +4927,7 @@ class Game:
 
             city = self.map.get_city(order['city_id'])
             city_location = self.map.get_city_location(order['city_id'])
+            order_kind = order.get('order_kind', 'force')
             force_kind = order.get('force_kind', 'regiment')
             spawn_position = tuple(order['spawn_pos']) if order.get('spawn_pos') is not None else city_location
             is_visible_to_viewer = (
@@ -3559,33 +4948,61 @@ class Game:
             if not city.can_queue_regiment():
                 order['turns_remaining'] = max(order['turns_remaining'], 1)
                 continue
+            if order_kind == 'improvement':
+                try:
+                    _, definition, normalized_target = self._validate_improvement_order(
+                        order['owner_id'],
+                        city.id,
+                        order['improvement_kind'],
+                        order.get('target_pos'),
+                    )
+                    improvement = Improvement(
+                        improvement_kind=definition.improvement_kind,
+                        city_id=city.id,
+                        owner_id=order['owner_id'],
+                        tile_pos=normalized_target,
+                    )
+                    self.map.add_improvement(improvement)
+                    city.add_experience(definition.city_xp_reward)
+                    if is_visible_to_viewer:
+                        if normalized_target is None:
+                            messages.append(f'{city.name} completed {definition.name}.')
+                        else:
+                            messages.append(f'{city.name} completed {definition.name} at {normalized_target}.')
+                    completed_orders.append(order)
+                except ValueError as error:
+                    if is_visible_to_viewer:
+                        messages.append(f'Build order delayed for city {city.id}: {error}')
+                    order['turns_remaining'] = 1
+                continue
             if force_kind == 'navy':
                 if spawn_position not in self.map.tiles:
                     if is_visible_to_viewer:
                         messages.append(
-                            f'Build order canceled for navy at city {city.id}: sea tile {spawn_position} is out of bounds.'
+                            f'Build order canceled for navy at city {city.id}: port tile {spawn_position} is out of bounds.'
                         )
                     completed_orders.append(order)
                     continue
                 spawn_tile = self.map.tiles[spawn_position]
-                if not spawn_tile.passable_water:
+                improvement = self.map.get_improvement(spawn_tile.improvement_id) if spawn_tile.improvement_id is not None else None
+                if improvement is None or not improvement.is_port():
                     if is_visible_to_viewer:
                         messages.append(
-                            f'Build order canceled for navy at city {city.id}: tile {spawn_position} is no longer sea.'
+                            f'Build order canceled for navy at city {city.id}: tile {spawn_position} is no longer a valid port.'
                         )
                     completed_orders.append(order)
                     continue
                 if spawn_tile.influence_owner_id != order['owner_id'] or spawn_tile.is_influence_contested:
                     if is_visible_to_viewer:
                         messages.append(
-                            f'Build order canceled for navy at city {city.id}: sea tile {spawn_position} is no longer securely owned.'
+                            f'Build order canceled for navy at city {city.id}: port tile {spawn_position} is no longer securely owned.'
                         )
                     completed_orders.append(order)
                     continue
                 if spawn_tile.regiment_id is not None:
                     if is_visible_to_viewer:
                         messages.append(
-                            f'Build order delayed for city {city.id}: sea tile {spawn_position} is currently occupied.'
+                            f'Build order delayed for city {city.id}: port tile {spawn_position} is currently occupied.'
                         )
                     order['turns_remaining'] = 1
                     continue
@@ -3607,7 +5024,7 @@ class Game:
                 if is_visible_to_viewer:
                     if force_kind == 'navy':
                         messages.append(
-                            f'Navy formed: {regiment.symbol()} launched from {city.name} at sea tile {spawn_position}.'
+                            f'Navy formed: {regiment.symbol()} launched from {city.name} at port {spawn_position}.'
                         )
                     else:
                         messages.append(f'Regiment formed: {regiment.symbol()} at city {city.name}.')
@@ -3630,18 +5047,26 @@ class Game:
 
         if not visible_orders:
             if show_empty_message:
-                print('No land or naval forces are currently queued for production for your empire.')
+                print('No forces or improvements are currently queued for production for your empire.')
             return
 
-        print('FORCE BUILD QUEUE:')
+        print('PRODUCTION QUEUE:')
         for order in visible_orders:
             city = self.map.get_city(order['city_id']) if self.map is not None else None
             city_name = city.name if city is not None else f'City {order["city_id"]}'
             turns_remaining = max(0, order['turns_remaining'])
+            order_kind = order.get('order_kind', 'force')
+            if order_kind == 'improvement':
+                target_pos = tuple(order['target_pos']) if order.get('target_pos') is not None else None
+                location_text = f' at tile {target_pos}' if target_pos is not None else ''
+                print(
+                    f"  {turns_remaining} turn(s) until {order['improvement_name']} finishes at {city_name}{location_text}."
+                )
+                continue
             force_kind = order.get('force_kind', 'regiment')
             if force_kind == 'navy':
                 print(
-                    f"  {turns_remaining} turn(s) until Navy '{order['regiment_name']}' appears at sea tile "
+                    f"  {turns_remaining} turn(s) until Navy '{order['regiment_name']}' appears at port "
                     f'{tuple(order["spawn_pos"])} from {city_name}.'
                 )
                 continue
@@ -3714,6 +5139,8 @@ class Game:
         build_messages = self.process_regiment_build_queue(viewer_player_id=self.selected_player_id)
         city_attack_messages = self.process_city_auto_attacks(viewer_player_id=self.selected_player_id)
         city_updates = self.map.advance_city_states_for_new_turn()
+        material_messages = self.process_material_income_for_new_round(viewer_player_id=self.selected_player_id)
+        growth_messages = self.process_city_growth_and_sovereignty(viewer_player_id=self.selected_player_id)
         draw_messages = self.process_influence_card_draws(viewer_player_id=self.selected_player_id)
         victory_result = self.evaluate_victory_conditions()
         self.last_round_summary = {
@@ -3722,6 +5149,8 @@ class Game:
             'build_messages': build_messages,
             'city_attack_messages': city_attack_messages,
             'city_updates': city_updates,
+            'material_messages': self._deduplicate_messages(material_messages),
+            'growth_messages': self._deduplicate_messages(growth_messages),
             'draw_messages': self._deduplicate_messages(draw_messages),
             'victory_result': victory_result,
         }
@@ -3754,7 +5183,17 @@ class Game:
                     f'{city.symbol} repairs delayed: {city.siege_repair_delay_turns_remaining} turn(s) remaining | '
                     f'regiment production lock={city.regiment_production_lock_turns_remaining}'
                 )
-        for key in ('resolution_messages', 'build_messages', 'city_attack_messages', 'expiration_messages', 'draw_messages'):
+            if update.get('capture_level_penalty_applied'):
+                print(f'{city.name} lost 2 city levels after the occupation stabilized (now level {city.level}).')
+        for key in (
+            'resolution_messages',
+            'build_messages',
+            'city_attack_messages',
+            'material_messages',
+            'growth_messages',
+            'expiration_messages',
+            'draw_messages',
+        ):
             for message in summary.get(key, []):
                 print(message)
 
@@ -3771,6 +5210,8 @@ class Game:
                     'build_messages': [],
                     'city_attack_messages': [],
                     'city_updates': [],
+                    'material_messages': [],
+                    'growth_messages': [],
                     'draw_messages': [],
                     'victory_result': self.evaluate_victory_conditions(),
                 }
@@ -3794,6 +5235,14 @@ class Game:
                 spawn_pos[1],
                 action.get('metadata', {}).get('regiment_name'),
             )
+        if action_type == 'queue_improvement':
+            metadata = action.get('metadata', {})
+            return self.queue_improvement_order(
+                player_id,
+                action['target_id'],
+                metadata.get('improvement_kind'),
+                metadata.get('target_pos'),
+            )
         if action_type == 'move_regiment':
             target_x, target_y = action['target_pos']
             return self.move_regiment_for_player(player_id, action['actor_id'], target_x, target_y)
@@ -3803,6 +5252,20 @@ class Game:
             return self.attack_with_regiment(player_id, action['actor_id'], 'city', action['target_id'])
         if action_type == 'defend_regiment':
             return self.defend_regiment_for_player(player_id, action['actor_id'])
+        if action_type == 'buy_card':
+            return self.purchase_card_for_player(player_id, action.get('metadata', {}).get('rarity', 'common'))
+        if action_type == 'recruit_hero':
+            return self.recruit_hero_for_player(
+                player_id,
+                action['target_id'],
+                action.get('metadata', {}).get('hero_name'),
+            )
+        if action_type == 'refit_force':
+            return self.refit_force_for_player(
+                player_id,
+                action['target_id'],
+                action.get('metadata', {}).get('upgrade_kind'),
+            )
         if action_type == 'play_card':
             player = self.map.get_player(player_id)
             if player is None:
@@ -3835,16 +5298,30 @@ class Game:
             if action_type == 'queue_navy':
                 return [
                     f'{player_name} queued navy "{result["regiment_name"]}" from {city_name} '
-                    f'to sea tile {result["spawn_pos"]} ({result["turns_to_build"]} turn(s) to build).'
+                    f'at port {result["spawn_pos"]} ({result["turns_to_build"]} turn(s) to build).'
                 ]
             return [
                 f'{player_name} queued regiment "{result["regiment_name"]}" at {city_name} '
+                f'({result["turns_to_build"]} turn(s) to build).'
+            ]
+        if action_type == 'queue_improvement':
+            city = self.map.get_city(result['city_id']) if self.map is not None else None
+            city_name = city.name if city is not None else f'City {result["city_id"]}'
+            location_text = f' at {result["target_pos"]}' if result.get('target_pos') is not None else ''
+            return [
+                f'{player_name} queued {result["improvement_name"]} for {city_name}{location_text} '
                 f'({result["turns_to_build"]} turn(s) to build).'
             ]
         if action_type == 'move_regiment':
             return [f'{player_name} moved Regiment {result["regiment_id"]} to {result["target_pos"]}.']
         if action_type == 'defend_regiment':
             return [f'{player_name} set Regiment {result["regiment_id"]} to defend.']
+        if action_type == 'buy_card':
+            return [f'{player_name} bought a {result["rarity"].title()} card: {result["card"].definition.name}.']
+        if action_type == 'recruit_hero':
+            return [f'{player_name} recruited {result["hero_name"]} into Regiment {result["regiment_id"]}.']
+        if action_type == 'refit_force':
+            return [f'{player_name} refit Regiment {result["regiment_id"]} with a {result["upgrade_kind"]} upgrade.']
         if action_type == 'play_card':
             messages = [f'{player_name} played {result["card"].definition.name}.']
             messages.extend(result['messages'])
@@ -4481,6 +5958,7 @@ class Game:
                 if not self.select_player_empire():
                     self.map = None
                     return
+                self.initialize_player_economy()
                 self.initialize_player_card_system()
                 self.initialize_turn_order()
                 self.player_in_loop = True
@@ -4509,9 +5987,9 @@ class Game:
         def _parse_delta_coordinates(raw_value: str, label: str = 'Movement delta'):
             return _parse_tile_coordinates(raw_value, label=label)
 
-        def _resolve_owned_sea_tile(selection: str, owner_id: int):
-            spawn_x, spawn_y = _parse_tile_coordinates(selection, label='Sea tile')
-            self._validate_navy_spawn_tile(owner_id, spawn_x, spawn_y)
+        def _resolve_owned_port_tile(selection: str, owner_id: int, city_id: int):
+            spawn_x, spawn_y = _parse_tile_coordinates(selection, label='Port tile')
+            self._validate_navy_spawn_tile(owner_id, city_id, spawn_x, spawn_y)
             return (spawn_x, spawn_y)
 
         def queue_regiment_order_action():
@@ -4550,14 +6028,18 @@ class Game:
                     input('Enter friendly city id or exact name to queue from: ').strip(),
                     selected_player.id,
                 )
-                owned_sea_tiles = self.get_player_owned_sea_tiles(selected_player.id)
-                if not owned_sea_tiles:
-                    raise ValueError('Your empire does not currently control any uncontested sea tiles.')
-                print(f'Owned sea tiles: {", ".join(str(position) for position in owned_sea_tiles)}')
-                spawn_pos = _resolve_owned_sea_tile(
-                    input('Enter owned sea tile for the navy to launch from as x y: ').strip(),
-                    selected_player.id,
-                )
+                port_improvements = self.map.get_city_ports(city.id)
+                if not port_improvements:
+                    raise ValueError(f'{city.name} needs a Port improvement before it can launch navies.')
+                if len(port_improvements) == 1:
+                    spawn_pos = tuple(port_improvements[0].tile_pos)
+                else:
+                    print(f'Available ports: {", ".join(str(tuple(port.tile_pos)) for port in port_improvements)}')
+                    spawn_pos = _resolve_owned_port_tile(
+                        input('Enter port tile for the navy to launch from as x y: ').strip(),
+                        selected_player.id,
+                        city.id,
+                    )
                 default_name = f'{city.name} Fleet'
                 navy_name = input(f'Enter navy name (default: {default_name}): ').strip() or default_name
                 result = self.queue_action_for_player(selected_player.id, {
@@ -4569,7 +6051,129 @@ class Game:
                     },
                 })
                 print(
-                    f"Planned navy '{navy_name}' from {city.name} to sea tile {spawn_pos}. "
+                    f"Planned navy '{navy_name}' from {city.name} at port {spawn_pos}. "
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def queue_improvement_order_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+
+            try:
+                Improvement.initialize_definitions()
+                city = _resolve_owned_city(
+                    input('Enter friendly city id or exact name to build from: ').strip(),
+                    selected_player.id,
+                )
+                print('Available improvements:')
+                for definition in Improvement.DEFINITIONS.values():
+                    if city.level < definition.min_city_level:
+                        continue
+                    print(
+                        f'  {definition.improvement_kind}: level>={definition.min_city_level} | '
+                        f'cost={definition.costs} | turns={definition.build_turns}'
+                    )
+                improvement_kind = input('Enter improvement kind: ').strip().lower()
+                definition = self.get_improvement_definition(improvement_kind)
+                target_pos = None
+                if not definition.intra_city:
+                    valid_positions = self.find_valid_improvement_sites_for_city(city.id, definition.improvement_kind)
+                    if not valid_positions:
+                        raise ValueError(f'No valid {definition.name} sites are currently available for {city.name}.')
+                    print(f'Valid sites: {", ".join(str(position) for position in valid_positions)}')
+                    target_pos = _parse_tile_coordinates(
+                        input('Enter target tile as x y: ').strip(),
+                        label='Improvement tile',
+                    )
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'queue_improvement',
+                    'target_id': city.id,
+                    'metadata': {
+                        'improvement_kind': definition.improvement_kind,
+                        'improvement_name': definition.name,
+                        'target_pos': target_pos,
+                    },
+                })
+                print(
+                    f'Planned {definition.name} for {city.name}. '
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def buy_card_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            try:
+                available_rarities = self.get_available_card_purchase_rarities(selected_player.id)
+                print(f'Buyable rarities: {", ".join(available_rarities)}')
+                rarity = input('Enter rarity to buy: ').strip().lower()
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'buy_card',
+                    'metadata': {'rarity': rarity},
+                })
+                print(
+                    f'Planned {rarity.title()} card purchase. '
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def recruit_hero_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            try:
+                regiment = _resolve_owned_regiment(
+                    input('Enter regiment/navy id or exact name to recruit into: ').strip(),
+                    selected_player.id,
+                )
+                hero_name = input('Enter hero name (leave empty for random): ').strip()
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'recruit_hero',
+                    'target_id': regiment.id,
+                    'metadata': {'hero_name': hero_name or None},
+                })
+                print(
+                    f'Planned hero recruitment for {regiment.symbol()}. '
+                    f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
+                )
+            except ValueError as error:
+                print(error)
+
+        def refit_force_action():
+            selected_player = self.get_selected_player()
+            if selected_player is None:
+                print('No empire is currently selected.')
+                return
+            try:
+                regiment = _resolve_owned_regiment(
+                    input('Enter regiment/navy id or exact name to refit: ').strip(),
+                    selected_player.id,
+                )
+                upgrade_kind = input('Choose upgrade [r]anged or [s]iege: ').strip().lower()
+                upgrade_lookup = {
+                    'r': 'ranged',
+                    'ranged': 'ranged',
+                    's': 'siege',
+                    'siege': 'siege',
+                }
+                if upgrade_kind not in upgrade_lookup:
+                    raise ValueError('Upgrade must be ranged or siege.')
+                result = self.queue_action_for_player(selected_player.id, {
+                    'action_type': 'refit_force',
+                    'target_id': regiment.id,
+                    'metadata': {'upgrade_kind': upgrade_lookup[upgrade_kind]},
+                })
+                print(
+                    f'Planned {upgrade_lookup[upgrade_kind]} refit for {regiment.symbol()}. '
                     f'Actions planned: {result["action_count"]}/{result["action_limit"]}.'
                 )
             except ValueError as error:
@@ -4587,10 +6191,16 @@ class Game:
                     selected_player.id,
                 )
                 result = self.cancel_regiment_order(selected_player.id, city.id)
-                print(
-                    f"Canceled {result.get('force_kind', 'regiment')} '{result['regiment_name']}' at {city.name}. "
-                    f'It had {max(0, result["turns_remaining"])} turn(s) remaining.'
-                )
+                if result.get('order_kind') == 'improvement':
+                    print(
+                        f"Canceled improvement '{result['improvement_name']}' at {city.name}. "
+                        f'It had {max(0, result["turns_remaining"])} turn(s) remaining.'
+                    )
+                else:
+                    print(
+                        f"Canceled {result.get('force_kind', 'regiment')} '{result['regiment_name']}' at {city.name}. "
+                        f'It had {max(0, result["turns_remaining"])} turn(s) remaining.'
+                    )
             except ValueError as error:
                 print(error)
 
@@ -4598,10 +6208,11 @@ class Game:
             action_menu = ConsoleMenu()
             action_menu.add_option('Queue Regiment', queue_regiment_order_action, 'q')
             action_menu.add_option('Queue Navy', queue_navy_order_action, 'n')
-            action_menu.add_option('Cancel Queued Force', cancel_regiment_order_action, 'c')
-            action_menu.add_option('View Force Build Queue', print_regiment_build_queue_status, 'v')
+            action_menu.add_option('Queue Improvement', queue_improvement_order_action, 'i')
+            action_menu.add_option('Cancel Queued Production', cancel_regiment_order_action, 'c')
+            action_menu.add_option('View Production Queue', print_regiment_build_queue_status, 'v')
             action_menu.add_option('Back', lambda: None, 'b')
-            print('---BUILD FORCE---')
+            print('---BUILD / PRODUCE---')
             action_menu.prompt_and_select()
 
         def _normalize_lookup_name(value: str):
@@ -5198,12 +6809,15 @@ class Game:
             player_menu.add_option('View Cards', print_cards_in_hand, 'h')
             player_menu.add_option('View Planned Actions', print_planned_actions, 'l')
             player_menu.add_option('Play Card', play_card_action, 'y')
+            player_menu.add_option('Buy Card', buy_card_action, 'k')
             player_menu.add_option('Discard Card', discard_card_action, 'd')
-            player_menu.add_option('Build Regiment', create_regiment_order, 'r')
-            player_menu.add_option('View Force Build Queue', print_regiment_build_queue_status, 'b')
+            player_menu.add_option('Build / Produce', create_regiment_order, 'r')
+            player_menu.add_option('View Production Queue', print_regiment_build_queue_status, 'b')
             player_menu.add_option('Move Regiment', move_regiment, 'v')
             player_menu.add_option('Combine/Split Regiment', combine_or_split_regiment, 's')
             player_menu.add_option('Regiment Attack/Defend', regiment_attack_or_defend, 'a')
+            player_menu.add_option('Recruit Hero', recruit_hero_action, 'e')
+            player_menu.add_option('Refit Force', refit_force_action, 'f')
             player_menu.add_option('Inspect All Owned Regiments', print_all_owned_regiments_metadata, 'g')
             player_menu.add_option('Inspect Regiment By Id', print_regiment_metadata_by_id, 'i')
             player_menu.add_option('Next Turn', advance_turn, 't')
@@ -5225,6 +6839,7 @@ class Game:
                         f'planned actions={self.get_player_planned_action_count(selected_player.id)}/{action_limit} | '
                         f'planned cards={self.get_player_planned_card_count(selected_player.id)}/{card_limit}'
                     )
+                    print(f'Materials: {selected_player.materials_summary()}')
                     if selected_player.deck is not None:
                         print(
                             f'Cards: hand={len(selected_player.hand)}/{selected_player.hand_limit()} | '
